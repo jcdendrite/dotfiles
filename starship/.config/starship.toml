@@ -1,0 +1,81 @@
+# Slightly above default (30ms) to accommodate the NTFS/HDD symlinks in ~
+scan_timeout = 50
+
+# Disabled modules — languages/tools/VCS not in use
+[bun]
+disabled = true
+[deno]
+disabled = true
+[lua]
+disabled = true
+[perl]
+disabled = true
+
+[cobol]
+disabled = true
+[crystal]
+disabled = true
+[elixir]
+disabled = true
+[elm]
+disabled = true
+[erlang]
+disabled = true
+[fennel]
+disabled = true
+[fortran]
+disabled = true
+[gleam]
+disabled = true
+[haskell]
+disabled = true
+[haxe]
+disabled = true
+[julia]
+disabled = true
+[mojo]
+disabled = true
+[nim]
+disabled = true
+[ocaml]
+disabled = true
+[odin]
+disabled = true
+[purescript]
+disabled = true
+[raku]
+disabled = true
+[red]
+disabled = true
+[rlang]
+disabled = true
+[solidity]
+disabled = true
+[typst]
+disabled = true
+[vlang]
+disabled = true
+[zig]
+disabled = true
+
+[meson]
+disabled = true
+[mise]
+disabled = true
+[pixi]
+disabled = true
+[spack]
+disabled = true
+
+[fossil_branch]
+disabled = true
+[fossil_metrics]
+disabled = true
+[hg_branch]
+disabled = true
+[hg_state]
+disabled = true
+[pijul_channel]
+disabled = true
+[vcsh]
+disabled = true
