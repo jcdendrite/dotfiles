@@ -59,6 +59,11 @@ if ! shopt -oq posix; then
   fi
 fi
 
+# Start ssh-agent if not running
+if [ -z "$SSH_AUTH_SOCK" ]; then
+    eval "$(ssh-agent -s)" > /dev/null
+fi
+
 # fnm (Fast Node Manager)
 export PATH="$HOME/.local/share/fnm:$PATH"
 eval "$(fnm env --use-on-cd)"
