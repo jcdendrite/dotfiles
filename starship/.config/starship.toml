@@ -1,5 +1,13 @@
 # Slightly above default (30ms) to accommodate the NTFS/HDD symlinks in ~
 scan_timeout = 50
+command_timeout = 1000
+
+# Show active GitHub account
+[custom.github]
+command = "gh auth status --active 2>&1 | grep 'Logged in' | sed 's/.*account //' | sed 's/ .*//'"
+when = true
+format = "[gh:$output]($style) "
+style = "bold bright-purple"
 
 # Disabled modules — languages/tools/VCS not in use
 [bun]
