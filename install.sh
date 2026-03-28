@@ -6,7 +6,7 @@ echo "=== Dotfiles Setup ==="
 # System packages
 echo "Installing system packages..."
 sudo apt update
-sudo apt install -y build-essential curl git keychain stow
+sudo apt install -y build-essential curl git jq keychain stow
 
 # fnm (Fast Node Manager)
 if ! command -v fnm &> /dev/null; then

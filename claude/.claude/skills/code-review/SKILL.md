@@ -1,6 +1,7 @@
 ---
 name: code-review
 description: Principal engineer code review of changed/new code before presenting to user
+allowed-tools: Read, Grep, Glob
 ---
 
 Review the code that was just written or modified. Act as a principal engineer reviewing a junior engineer's work. Be thorough but not pedantic.

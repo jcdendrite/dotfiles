@@ -1,6 +1,7 @@
 ---
 name: respond-pr
 description: Read and respond to PR review comments on the current branch's pull request
+argument-hint: "[PR number]"
 ---
 
 Fetch all review comments on the current branch's open pull request and address them.
