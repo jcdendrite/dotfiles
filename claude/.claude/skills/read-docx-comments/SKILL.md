@@ -1,4 +1,5 @@
 ---
+name: read-docx-comments
 description: Extract comments from a .docx file and show them with their anchored text context
 ---
 

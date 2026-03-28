@@ -1,4 +1,5 @@
 ---
+name: respond-pr
 description: Read and respond to PR review comments on the current branch's pull request
 ---
 
