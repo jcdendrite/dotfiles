@@ -1,6 +1,7 @@
 ---
 name: read-docx-comments
 description: Extract comments from a .docx file and show them with their anchored text context
+argument-hint: "<path/to/file.docx>"
 ---
 
 Extract all comments from the provided .docx file. The user uses this to give feedback on plans and documents by adding comments in Google Docs / Word.
