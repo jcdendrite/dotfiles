@@ -1,4 +1,5 @@
 {
+  "model": "Opus",
   "hooks": {
     "PreToolUse": [
       {
@@ -17,8 +18,5 @@
     "type": "command",
     "command": "bash ~/.claude/statusline-command.sh"
   },
-  "effortLevel": "high",
-  "enabledPlugins": {
-    "atlassian@claude-plugins-official": true
-  }
+  "effortLevel": "high"
 }

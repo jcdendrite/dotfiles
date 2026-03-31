@@ -1,13 +1,14 @@
 ---
 name: test-conventions
 description: >
-  Testing conventions and principles for any codebase: test pyramid, test isolation,
-  mock design, coverage judgment, and common anti-patterns.
-  TRIGGER when: discussing test strategy, planning tests for new code, reviewing
-  test coverage, when someone proposes a testing approach that seems wrong-layered,
-  or when writing test infrastructure (mocks, helpers, fixtures).
-  DO NOT TRIGGER when: a project-level test skill is already loaded, or the task
-  is purely mechanical (running tests, fixing a single assertion, updating a snapshot).
+  Testing conventions for writing tests in any codebase: test pyramid layers,
+  design for testability, test isolation, naming, test data, coverage judgment,
+  and mock design.
+  TRIGGER when: planning tests for new code, writing test infrastructure
+  (mocks, helpers, fixtures), or discussing test strategy for new features.
+  DO NOT TRIGGER when: a project-level test skill is already loaded, the task
+  is purely mechanical (running tests, fixing a single assertion, updating a
+  snapshot), or evaluating/debugging an existing test suite (use test-evaluation).
 user-invocable: false
 ---
 
@@ -20,31 +21,12 @@ user-invocable: false
 | **Unit** (stubbed deps) | Milliseconds | None | Branch logic, error paths, edge cases, data transformations | Many — every code path |
 | **Integration** (real local services) | Hundreds of ms | Local DB, local services | Auth boundaries, response contracts, wiring between layers | Few — happy path + key error paths per endpoint or boundary |
 | **Contract** (schema verification) | Milliseconds–seconds | None (consumer) or local (provider) | API schemas between services match consumer expectations | One per service boundary |
-| **Smoke / E2E** (real external APIs) | Seconds | Third-party APIs, real infra | Full flow works end-to-end | 1-2 per feature, run on deploy not on every commit |
+| **E2E** (real external APIs) | Seconds | Third-party APIs, real infra | Complete user flows work end-to-end | Few per critical flow, run pre-merge or scheduled |
+| **Smoke** (post-deploy health) | Seconds | Production/staging infra | Critical paths are up after deployment | 1-2 per service, run on deploy only |
 
 **Contract tests** verify that service-to-service API schemas stay compatible without requiring a running instance of the other service. Use them at any service boundary where teams deploy independently.
 
-### Signs of an inverted pyramid
-- Most tests call real services (DB, APIs) to test internal branching logic
-- Tests are slow (>1s each) because of network round-trips
-- Individual unit tests taking >50-100ms, indicating a hidden real dependency or overly complex setup
-- External API rate limits constrain how often you can run the test suite
-- Tests are flaky because of network timeouts or service availability
-- You can't run the test suite offline or in CI without credentials
-- Adding a new code branch requires setting up complex test state in a real database
-
-### When to move a test down the pyramid
-
-**Integration → unit when:**
-- The test sets up complex DB state to exercise one `if` branch
-- The test hits an external API just to test error handling
-- The test is slow (>500ms) and tests pure logic, not wiring
-- You're hitting rate limits on external APIs
-
-**Smoke → integration when:**
-- The test calls a real third-party API to verify your code handles errors
-- The test is flaky because of network conditions
-- The test creates real resources (emails, contacts) as a side effect
+**E2E tests** verify complete user journeys across the full stack. **Smoke tests** are lightweight post-deploy checks that verify critical paths are functional — they answer "is it up?" not "does every flow work?"
 
 ## 2. Design for testability
 
@@ -69,17 +51,20 @@ Use the narrowest double that covers the test's intent. Prefer stubs for unit te
 - **Database calls:** Stub/fake the client object, or use transaction rollback isolation (see section 3)
 - **External HTTP APIs:** Intercept by URL pattern or use a fake HTTP server
 - **Env vars / config:** Set and restore in setup/teardown blocks
-- **Time:** Inject timestamps as parameters, or set up data relative to "now"
+- **Time:** Inject timestamps as parameters rather than relying on the system clock
 
 ## 3. Test isolation
+
+### Avoid global state in tests when possible
+Prefer designs that pass dependencies explicitly rather than relying on global state. When global state is unavoidable, follow the rules below.
+
+### Global state must be saved and restored
+When tests modify global state (env vars, global functions, singletons), always save the original and restore in a guaranteed cleanup block (teardown, `finally`, `defer`, etc.). **Never** unconditionally delete or overwrite global state — a test that removes a value without saving it first will break every subsequent test that needs it.
 
 ### Tests must be independent
 - Never rely on test execution order
 - Each test creates its own data and cleans up in teardown
 - Use unique identifiers (timestamps, counters) to prevent cross-test collision
-
-### Global state must be saved and restored
-When tests modify global state (env vars, global functions, singletons), always save the original and restore in a guaranteed cleanup block (teardown, `finally`, `defer`, etc.). **Never** unconditionally delete or overwrite global state — a test that removes a value without saving it first will break every subsequent test that needs it.
 
 ### Test double cleanup must be guaranteed
 When replacing globals (HTTP client, fetch function, clock), always restore the original in a guaranteed cleanup block, even if the test fails or throws.
@@ -90,7 +75,7 @@ When replacing globals (HTTP client, fetch function, clock), always restore the 
 - **In-memory vs. real engine:** In-memory databases (e.g., SQLite in-memory mode) are fast but have dialect differences (JSON columns, CTEs, locking behavior). When dialect fidelity matters, use the same engine as production.
 
 ### Parallel-safe tests
-When tests run in parallel (pytest-xdist, Jest workers, Go's `t.Parallel()`, JUnit parallel mode):
+Whether running locally or in CI, parallel test runners (pytest-xdist, Jest workers, Go's `t.Parallel()`, JUnit parallel mode) introduce isolation requirements:
 - Never bind to hardcoded ports; use port 0 or dynamic allocation
 - Use unique temp directories per test (e.g., `mkdtemp`, test-scoped `tmp_path`)
 - When sharing a test database, use per-test schemas or transaction rollback isolation
@@ -135,20 +120,24 @@ For tests that guard against a specific past bug, include a comment or docstring
 - Side effects via mocks (did it call `.update()` with the right payload?)
 
 **Integration tests:**
-- **HTTP-level:** Auth rejection (401/403), authorized success (2xx), response shape (expected fields and types)
+- **HTTP-level:** Auth rejection (401/403), authorized success (2xx), response shape — the actual output your endpoint produces (fields, types, status codes)
 - **Service/module-level:** Wiring between layers maps results correctly, shared modules are called with expected arguments
 - Not every integration test needs to go through HTTP — service-level integration tests are cheaper when you're verifying wiring, not auth or response shape
 - Don't re-test every branch — that's the unit tests' job
 
 **Contract tests:**
-- Consumer expectations match the provider's actual schema
+- Consumer expectations match the provider's actual API schema — the agreed-upon interface between services, independent of either side's implementation
+- Distinct from integration response shape tests: contract tests verify the *schema agreement* between services; integration tests verify your *code's actual output*
 - Run when either side changes; no need for a live instance of the other service
 
+**E2E tests:**
+- Complete user flows across the full stack
+- Run pre-merge or on a schedule, not on every commit
+- Use test/sandbox accounts and environments
+
 **Smoke tests:**
-- One happy-path test per external API integration
-- Run on deploy or post-merge to main, not on feature branches or pre-merge CI
-- Use test/sandbox accounts
-- Never use smoke tests to verify branching logic
+- One lightweight check per critical path, post-deploy
+- Never use smoke tests to verify branching logic or complete flows
 
 ### Security controls require both allow and deny paths
 For any access control, auth check, or privilege boundary:
@@ -186,40 +175,15 @@ If an assertion checks a value that was set up directly in the test double rathe
 
 **Good (tests real logic):** stub `getUser` to return `{name: "Alice", role: "admin"}`, then assert the formatted display string equals `"Alice (Admin)"`. This tests the formatting/transformation logic the code actually performs.
 
-## 8. Flaky tests
+## 8. Common authoring mistakes
 
-When a test is intermittently failing:
+Avoid these when writing new tests:
 
-1. **Root-cause first** — diagnose the specific cause:
-   - Test isolation failure (shared state, execution order dependency)
-   - External service timing (network, container startup, API availability)
-   - Time zone sensitivity (test passes in one TZ, fails in another — common with date boundary logic)
-   - Locale-dependent formatting (number/date formats vary by system locale)
-   - Floating point comparison (use approximate equality, not exact)
-   - Async timing (asserting on async state without proper synchronization)
-   - Non-deterministic iteration order (hash maps/sets with no guaranteed order)
-   - Port or resource conflicts in parallel execution
-2. **Fix the layer** — if the test is flaky because it hits a real service to test logic, push it down the pyramid (see section 1)
-3. **Quarantine in-test retries** — retry loops inside test code mask the underlying issue. If a fix isn't immediate, quarantine the test (skip with a tracking issue) rather than letting it erode trust in the suite. CI-level retry policies (rerun failed tests once before failing the build) are a separate, reasonable practice for transient infrastructure issues — but track retry rates and investigate if a test needs retries frequently
-4. **Never delete without replacement** — a flaky integration test that covers an auth boundary still represents needed coverage. Replace it with a reliable test at the right layer before removing it
-
-## 9. Anti-patterns
-
-| Anti-pattern | Why it's wrong | Fix |
-|---|---|---|
-| All tests are integration tests | Slow, flaky, can't test every branch | Extract logic, add unit tests with stubs |
-| Testing the test double | Assertions check values set up in the stub, not derived by code under test | Assert on values the code computed or transformed |
-| No integration tests at all | Auth bugs, response shape regressions | Keep a few focused integration tests per endpoint |
-| Smoke tests on every commit | Slow CI, rate limit exhaustion, flaky | Run smoke tests on deploy only |
-| Testing implementation details | Tests break on refactor with no behavior change | Test inputs and outputs, not internal mechanics |
-| Tautological assertions | `assert("error" in body or "data" in body)` passes on any response | Assert specific values |
-| Duplicating production code in tests | Test passes with stale copy, drift | Import or call via integration |
-| Reading source files to test behavior | Tests source text, not runtime behavior | Call function, assert output |
-| Unconditional global state deletion | Breaks subsequent tests that need the value | Save and restore in guaranteed cleanup |
-| In-test retry loops for flaky tests | Masks root cause, inflates suite duration | Root-cause and fix or quarantine |
-| Test interdependence | Test B depends on state from Test A; reorder breaks both | Each test sets up and tears down its own state |
-| Assertion-free tests | Test runs code but never asserts; passes as long as nothing throws | Every test must assert on a specific expected outcome |
-| Sleep-based synchronization | `sleep(2)` to wait for async work; slow and still flaky | Use polling with timeout, await, or synchronization primitives |
-| Hardcoded colliding test data | Every test uses `id=1` or `email=test@example.com`; parallel runs collide | Generate unique identifiers per test |
-| Over-mocking | So many mocks that the test encodes the implementation, not behavior; brittle to refactors | Mock only direct dependencies; let integration tests cover wiring |
-| Mocking third-party internals | Mocking a library's internal API rather than its public interface | Use the library's test utilities or mock at your own abstraction boundary |
+| Mistake | Fix |
+|---|---|
+| Assertion-free tests (code runs but nothing is asserted) | Every test must assert on a specific expected outcome |
+| Sleep-based synchronization (`sleep(2)` for async work) | Use polling with timeout, await, or synchronization primitives |
+| Hardcoded colliding test data (`id=1`, `email=test@example.com`) | Generate unique identifiers per test |
+| Over-mocking (test encodes implementation, not behavior) | Mock only direct dependencies; let integration tests cover wiring |
+| Mocking third-party internals (library's private API) | Use the library's test utilities or mock at your own abstraction boundary |
+| Testing the test double (asserting stub's own return value) | Assert on values the code computed or transformed |
