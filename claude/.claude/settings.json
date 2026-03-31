@@ -6,7 +6,6 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Bash(git commit*)",
             "command": "~/.claude/hooks/require-code-review.sh",
             "statusMessage": "Checking code review..."
           }
@@ -17,6 +16,5 @@
   "statusLine": {
     "type": "command",
     "command": "bash ~/.claude/statusline-command.sh"
-  },
-  "effortLevel": "high"
+  }
 }

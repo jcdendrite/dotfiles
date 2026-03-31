@@ -9,7 +9,10 @@ Fetch all review comments on the current branch's open pull request and address 
 ## Steps
 
 1. Identify the PR number for the current branch: `gh pr view --json number -q '.number'`
-2. Fetch all review comments: `gh api repos/{owner}/{repo}/pulls/{number}/comments`
+2. Fetch **both** types of review comments:
+   - **Inline file comments:** `gh api repos/{owner}/{repo}/pulls/{number}/comments`
+   - **Top-level review comments:** `gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '.[] | select(.body != "")'`
+   - Also check for **issue-level comments:** `gh api repos/{owner}/{repo}/issues/{number}/comments`
 3. For each unresolved comment:
    - Read the referenced file and line to understand the context
    - Determine if it requires a code change, a reply, or both
