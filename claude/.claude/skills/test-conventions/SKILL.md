@@ -25,8 +25,8 @@ user-invocable: false
 | **Smoke** (post-deploy health) | Seconds | Production/staging infra | Critical paths are up after deployment | 1-2 per service, run on deploy only |
 
 **Contract tests** verify that service-to-service API schemas stay compatible without requiring a running instance of the other service. Use them at any service boundary where teams deploy independently.
-
-**E2E tests** verify complete user journeys across the full stack. **Smoke tests** are lightweight post-deploy checks that verify critical paths are functional — they answer "is it up?" not "does every flow work?"
+**E2E tests** verify complete user journeys across the full stack. 
+**Smoke tests** are lightweight post-deploy checks that verify critical paths are functional — they answer "is it up?" not "does every flow work?"
 
 ## 2. Design for testability
 
@@ -76,7 +76,7 @@ When replacing globals (HTTP client, fetch function, clock), always restore the 
 
 ### Parallel-safe tests
 Whether running locally or in CI, parallel test runners (pytest-xdist, Jest workers, Go's `t.Parallel()`, JUnit parallel mode) introduce isolation requirements:
-- Never bind to hardcoded ports; use port 0 or dynamic allocation
+- In tests that may run concurrently, never bind to hardcoded ports; use port 0 or dynamic allocation
 - Use unique temp directories per test (e.g., `mkdtemp`, test-scoped `tmp_path`)
 - When sharing a test database, use per-test schemas or transaction rollback isolation
 - If a test mutates module-level state, it cannot safely run in parallel — document this constraint explicitly
@@ -128,6 +128,7 @@ For tests that guard against a specific past bug, include a comment or docstring
 **Contract tests:**
 - Consumer expectations match the provider's actual API schema — the agreed-upon interface between services, independent of either side's implementation
 - Distinct from integration response shape tests: contract tests verify the *schema agreement* between services; integration tests verify your *code's actual output*
+- **When to use contract vs integration for response shape:** Use integration tests when you own both sides (or there's a single consumer) and can run the provider locally. Use contract tests when provider and consumer are owned by different teams, deploy independently, or when spinning up the provider in tests is expensive
 - Run when either side changes; no need for a live instance of the other service
 
 **E2E tests:**

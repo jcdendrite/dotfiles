@@ -32,10 +32,12 @@ These are heuristics, not rules — evaluate each case against the specific code
 - The test is slow (>500ms) and tests pure logic, not wiring
 - You're hitting rate limits on external APIs
 
-**E2E/Smoke → integration when:**
+**E2E → integration when:**
 - The test calls a real third-party API to verify your code handles errors
 - The test is flaky because of network conditions
 - The test creates real resources (emails, contacts) as a side effect
+
+Note: smoke tests serve a fundamentally different purpose (verifying deployment health, not behavior). They don't move down the pyramid — if a smoke test is failing, the issue is the deployment or infrastructure, not the test layer.
 
 ## 3. Flaky test diagnosis
 
