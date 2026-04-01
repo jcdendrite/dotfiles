@@ -251,8 +251,11 @@ about attack vectors while a backend reviewer thinks about API contracts.
 | Security | CISO | Threat modeling, auth boundaries, privilege escalation, data exposure, defense in depth |
 | Data | Staff data engineer | Migration safety, schema design, reversibility, deploy-time compatibility, index coverage, access control on new objects |
 | Infrastructure | Staff DevOps engineer | CI/CD pipelines, IaC, deployment ordering, environment parity, secret provisioning |
+| Testing | Senior SDET | Testability of the design, edge cases the plan omits, test strategy coverage vs risk areas, test data requirements |
+| Product | Staff product engineer | Whether the plan solves the actual user problem, UX impact during migrations, feature interactions, user-facing regressions hidden behind technical framing |
 
 For multi-domain plans, evaluate from each relevant persona. Always include the
+Product persona when the plan changes user-facing behavior. Always include the
 CISO persona when the plan touches auth, authorization, secrets, tokens, data
 exposure, logging of sensitive data, third-party data sharing, or infrastructure
 permissions.
