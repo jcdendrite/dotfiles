@@ -246,18 +246,20 @@ about attack vectors while a backend reviewer thinks about API contracts.
 
 | Domain | Reviewer role | Focus |
 |--------|--------------|-------|
-| Backend | Staff backend engineer | API contracts, error handling, service boundaries, SDK behavior |
-| Frontend | Staff frontend engineer | Component patterns, state management, query cache invalidation, UX impact |
+| Backend | Staff backend engineer | API contracts, error handling, idempotency, retry semantics, service boundaries, SDK behavior |
+| Frontend | Staff frontend engineer | Component patterns, state management, data fetching and cache consistency, accessibility, UX impact |
 | Security | CISO | Threat modeling, auth boundaries, privilege escalation, data exposure, defense in depth |
-| Data | Staff data engineer | Migration safety, schema design, index coverage, access control on new objects |
+| Data | Staff data engineer | Migration safety, schema design, reversibility, deploy-time compatibility, index coverage, access control on new objects |
 | Infrastructure | Staff DevOps engineer | CI/CD pipelines, IaC, deployment ordering, environment parity, secret provisioning |
 
 For multi-domain plans, evaluate from each relevant persona. Always include the
-CISO persona when the plan touches auth, authorization, secrets, tokens, or data
-exposure.
+CISO persona when the plan touches auth, authorization, secrets, tokens, data
+exposure, logging of sensitive data, third-party data sharing, or infrastructure
+permissions.
 
-Project-level plan-review skills may override or extend this table with
-project-specific reviewer roles and focus areas.
+Project-level plan-review skills may extend this table with project-specific
+reviewer roles and focus areas, but must not remove or narrow the CISO trigger
+conditions.
 
 ## Output format
 
