@@ -238,6 +238,27 @@ S6. **Secret lifecycle** — If the plan introduces, rotates, or references secr
 - Generic "add more tests" suggestions, **except** for security controls where
   untested invariants are indistinguishable from absent ones (see S1)
 
+## Reviewer roles
+
+When spawning reviewer agents, adopt the persona that matches each detected
+domain. Different personas catch different things — a security reviewer thinks
+about attack vectors while a backend reviewer thinks about API contracts.
+
+| Domain | Reviewer role | Focus |
+|--------|--------------|-------|
+| Backend | Staff backend engineer | API contracts, error handling, service boundaries, SDK behavior |
+| Frontend | Staff frontend engineer | React/hooks patterns, state management, query cache invalidation, UX impact |
+| Security | CISO | Threat modeling, auth boundaries, privilege escalation, data exposure, defense in depth |
+| Data | Staff data engineer | Migration safety, schema design, index coverage, access control on new objects |
+| Infrastructure | Staff DevOps engineer | CI/CD pipelines, IaC, deployment ordering, environment parity, secret provisioning |
+
+For multi-domain plans, evaluate from each relevant persona. Always include the
+CISO persona when the plan touches auth, authorization, secrets, tokens, or data
+exposure.
+
+Project-level plan-review skills may override or extend this table with
+project-specific reviewer roles and focus areas.
+
 ## Output format
 
 Start with which domains were detected and which plan sections/phases were reviewed.
