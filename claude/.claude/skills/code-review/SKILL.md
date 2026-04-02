@@ -180,7 +180,7 @@ hats. Update this table as new patterns emerge.
 | Changes API response shape | **Product Engineer** — verify all consumers handle new shape |
 | Adds/modifies security controls | **Senior SDET** — verify test pyramid and coverage |
 | Changes auth model (JWT, roles, permissions) | **Security Engineer** — trace all auth paths |
-| Modifies shared utilities (`_shared/`, hooks) | **Backend/Frontend Engineer** — verify all call sites |
+| Modifies shared utilities (helpers, hooks, contexts) | **Backend/Frontend Engineer** — verify all call sites |
 | Changes data model (columns, types, defaults) | **Product + Backend Engineer** — check queries, types, UI |
 | Modifies infrastructure (CI, deploy, config) | **DevOps/Infra Engineer** — verify pipelines |
 
@@ -191,5 +191,5 @@ section with entries like:
   by tracing [specific code paths].
 
 Be specific about WHAT to check, not just WHO. "PE review recommended" is
-useless; "PE should verify the counter-offer workflow still works after the
-status restriction" is actionable.
+useless; "PE should verify the checkout flow in CheckoutPage.tsx still works
+after the new validation constraint" is actionable.
