@@ -15,8 +15,10 @@ ask_with_reason() {
   exit 0
 }
 
-# --- Block: integration / e2e test runners hit real dependencies ---
-# Only flag when a known test runner is the command AND integration/e2e keywords are present
+# --- Safety net: flag commands with integration/e2e keywords ---
+# Keyword-based catch for explicitly named integration/e2e test runs.
+# This supplements (not replaces) the safelist below, which only auto-allows
+# a narrow set of unit test runners — everything else already falls through to "ask".
 if echo "$COMMAND" | grep -qiE '(^|\s)(npm|npx|jest|vitest|mocha|pytest|python|go|cargo|make)\s' \
    && echo "$COMMAND" | grep -qiE '(integrat|e2e|end.to.end|test:int|test:e2e)'; then
   ask_with_reason "This command may run integration/e2e tests against shared resources (DB, APIs). Multiple sessions could conflict — confirm the target environment is safe to use."
