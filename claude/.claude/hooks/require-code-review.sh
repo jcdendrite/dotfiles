@@ -26,7 +26,7 @@ fi
 # Only flag when a known test runner is the command AND integration/e2e keywords are present
 if echo "$COMMAND" | grep -qiE '(^|\s)(npm|npx|jest|vitest|mocha|pytest|python|go|cargo|make)\s' \
    && echo "$COMMAND" | grep -qiE '(integrat|e2e|end.to.end|test:int|test:e2e)'; then
-  ask_with_reason "This looks like an integration/e2e test that may hit real dependencies (DB, network). Confirm before running."
+  ask_with_reason "This command may run integration/e2e tests against shared resources (DB, APIs). Multiple sessions could conflict — confirm the target environment is safe to use."
 fi
 
 # --- Safelist: read-only and low-risk commands ---
