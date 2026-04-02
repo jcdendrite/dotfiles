@@ -43,9 +43,10 @@ case "$BASE_CMD" in
 esac
 
 # Process / system inspection
-# env and printenv excluded — they dump environment variables which may contain secrets
+# Excluded: env, printenv (secrets), whoami, hostname, id (PII),
+# uname (machine fingerprinting), locale (geographic/language info)
 case "$BASE_CMD" in
-  echo|whoami|hostname|date|uname|id|locale|uptime)
+  echo|date|uptime)
     allow
     ;;
 esac
