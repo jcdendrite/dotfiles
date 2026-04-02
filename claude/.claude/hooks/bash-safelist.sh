@@ -70,14 +70,9 @@ if printf '%s\n' "$COMMAND" | grep -qE '^(go list|go env|go doc)( |$)'; then
   allow
 fi
 
-# Unit/component test runners — only auto-allow direct invocations of tools
-# that overwhelmingly run against mocked dependencies. npm test/npm run test
-# are excluded because they're indirection into arbitrary package.json scripts.
-# Runners that commonly hit real dependencies (deno test, pytest, go test,
-# cargo test, mvn test, gradle test) fall through to default "ask".
-if printf '%s\n' "$COMMAND" | grep -qE '^(npx jest|npx vitest|npx mocha)( |$)'; then
-  allow
-fi
+# Test runners — all excluded. They execute project code (config files, test
+# files, setup scripts) and may hit real dependencies. Same blast radius as
+# npm test regardless of the specific runner.
 
 # Build commands
 # make, cargo build, go build excluded — they execute arbitrary project code
