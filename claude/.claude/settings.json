@@ -6,11 +6,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/bash-guard.sh",
-            "statusMessage": "Checking command safety..."
-          },
-          {
-            "type": "command",
             "if": "Bash(git commit *)",
             "command": "~/.claude/hooks/require-code-review.sh",
             "statusMessage": "Checking code review..."

@@ -124,7 +124,9 @@ Evaluate the code against each item. Only flag items where there is a concrete i
 
 35. **Permission scope** — Do `permissions.allow` rules in settings.json follow
     least-privilege? Flag blanket allows (`"Bash"`) where scoped allows
-    (`"Bash(git:*)"`) would suffice.
+    (`"Bash(git:*)"`) would suffice. If permissions.allow rules were
+    added or modified, invoke `/review-permissions` for deep security
+    analysis.
 
 36. **Hook correctness** — Do PreToolUse/PostToolUse hooks block the right
     operations without false positives? A hook that blocks legitimate work
