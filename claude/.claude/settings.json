@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/bash-safelist.sh",
-            "statusMessage": "Checking command safelist..."
+            "command": "~/.claude/hooks/bash-guard.sh",
+            "statusMessage": "Checking command safety..."
           },
           {
             "type": "command",
