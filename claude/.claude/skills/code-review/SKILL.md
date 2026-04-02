@@ -176,11 +176,11 @@ hats. Update this table as new patterns emerge.
 
 | Change type | Follow-up |
 |-------------|-----------|
-| Restricts DB access (RLS, GRANT, triggers) | **Product Engineer** — trace restrictions against caller code |
-| Changes API response shape | **Product Engineer** — verify all consumers handle new shape |
-| Adds/modifies security controls | **Senior SDET** — verify test pyramid and coverage |
-| Changes auth model (JWT, roles, permissions) | **Security Engineer** — trace all auth paths |
-| Modifies shared utilities (helpers, hooks, contexts) | **Backend/Frontend Engineer** — verify all call sites |
+| Restricts DB access (RLS, GRANT, triggers) | **Product + Fullstack Engineer** — trace restrictions against caller code |
+| Changes API response shape | **Product + Fullstack Engineer** — verify all consumers handle new shape |
+| Adds/modifies security controls | **Senior SDET + Security Engineer** — verify test pyramid, coverage, and threat model |
+| Changes auth model (JWT, roles, permissions) | **Security + Backend Engineer** — trace all auth paths |
+| Modifies shared utilities (helpers, hooks, contexts) | **Backend + Frontend Engineer** — verify all call sites |
 | Changes data model (columns, types, defaults) | **Product + Backend Engineer** — check queries, types, UI |
 | Modifies infrastructure (CI, deploy, config) | **DevOps/Infra Engineer** — verify pipelines |
 
