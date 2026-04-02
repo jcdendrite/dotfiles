@@ -85,30 +85,32 @@ Evaluate the code against each item. Only flag items where there is a concrete i
 
 23. **Bundle impact** — Does the change add a large new dependency where a smaller alternative or existing utility exists? Flag full-library imports (e.g., all of lodash) when only one function is used.
 
+24. **State-dependent rendering coverage** — Does the change modify which UI state a component enters (conditional branches, state machines, context-driven rendering)? If so, check whether component tests exist that verify the affected states render correctly. For each new or changed condition, is there a test that the component renders the expected output for each branch?
+
 ## Domain: Backend
 
-24. **Auth boundary coverage** — Does every new endpoint or RPC have both authentication (who is the caller?) and authorization (can they do this?)? Check that auth checks are not bypassable by hitting the endpoint directly rather than through the expected UI flow.
+25. **Auth boundary coverage** — Does every new endpoint or RPC have both authentication (who is the caller?) and authorization (can they do this?)? Check that auth checks are not bypassable by hitting the endpoint directly rather than through the expected UI flow.
 
-25. **Input validation at system boundaries** — Is user input validated/sanitized before use in SQL queries, shell commands, file paths, or external API calls? Framework-provided parameterization counts; string concatenation does not.
+26. **Input validation at system boundaries** — Is user input validated/sanitized before use in SQL queries, shell commands, file paths, or external API calls? Framework-provided parameterization counts; string concatenation does not.
 
-26. **Error response leakage** — Do error responses expose internal details (stack traces, internal IDs, database error messages, file paths) to the caller? Internal errors should be logged server-side and return a generic message to the client.
+27. **Error response leakage** — Do error responses expose internal details (stack traces, internal IDs, database error messages, file paths) to the caller? Internal errors should be logged server-side and return a generic message to the client.
 
 ## Domain: Claude Code config
 
-27. **Skill trigger accuracy** — Do TRIGGER and DO NOT TRIGGER conditions
+28. **Skill trigger accuracy** — Do TRIGGER and DO NOT TRIGGER conditions
     match the skill's actual purpose? A skill that triggers too broadly wastes
     context; one that triggers too narrowly gets skipped when needed.
 
-28. **Context budget** — Are skill files, plan files, and settings concise enough
+29. **Context budget** — Are skill files, plan files, and settings concise enough
     to fit within the AI's working context without displacing active task
     instructions? Long files dilute attention on the actual task. Flag files that
     could be shortened without losing actionable information.
 
-29. **Permission scope** — Do `permissions.allow` rules in settings.json follow
+30. **Permission scope** — Do `permissions.allow` rules in settings.json follow
     least-privilege? Flag blanket allows (`"Bash"`) where scoped allows
     (`"Bash(git:*)"`) would suffice.
 
-30. **Hook correctness** — Do PreToolUse/PostToolUse hooks block the right
+31. **Hook correctness** — Do PreToolUse/PostToolUse hooks block the right
     operations without false positives? A hook that blocks legitimate work
     is worse than no hook — it trains users to bypass the system.
 
@@ -116,21 +118,21 @@ Evaluate the code against each item. Only flag items where there is a concrete i
 
 Apply when changed files match `.lovable/**`.
 
-31. **Perspective** — Are instructions written from Lovable's perspective
+32. **Perspective** — Are instructions written from Lovable's perspective
     (second person, addressed to Lovable)? Knowledge files that read as
     internal engineering notes will confuse Lovable.
 
-32. **Specificity** — Are instructions specific enough to prevent unintended
+33. **Specificity** — Are instructions specific enough to prevent unintended
     behavior? Lovable follows instructions literally and may over-apply vague
     guidance (e.g., "be careful with auth" → Lovable adds auth checks to
     public endpoints).
 
-33. **Context budget** — Are knowledge files concise enough to fit within
+34. **Context budget** — Are knowledge files concise enough to fit within
     Lovable's working context without displacing active task instructions?
     Same principle as Claude Code skills — long knowledge files dilute
     attention.
 
-34. **Sync status** — If project-knowledge.md or workspace-knowledge.md
+35. **Sync status** — If project-knowledge.md or workspace-knowledge.md
     changed, does the PR description mention syncing to the Lovable UI?
     The file is the source of truth, but Lovable reads from the UI field.
 
