@@ -4,6 +4,8 @@ description: Read and respond to PR review comments on the current branch's pull
 argument-hint: "[PR number]"
 ---
 
+TRIGGER when: the user asks to reply to, respond to, or address PR review comments, or when you need to post a reply to a GitHub PR comment thread. Always use this skill instead of manually calling the GitHub PR comments API.
+
 Fetch all review comments on the current branch's open pull request and address them.
 
 ## Steps
