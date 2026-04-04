@@ -6,7 +6,7 @@ echo "=== Dotfiles Setup ==="
 # System packages
 echo "Installing system packages..."
 sudo apt update
-sudo apt install -y build-essential curl git jq keychain stow
+sudo apt install -y build-essential curl git jq keychain stow xclip
 
 # fnm (Fast Node Manager)
 if ! command -v fnm &> /dev/null; then
@@ -28,6 +28,10 @@ cd "$DOTFILES_DIR"
 stow -v --adopt -t "$HOME" bash
 stow -v --adopt -t "$HOME" claude
 stow -v --adopt -t "$HOME" starship
+
+# kitty requires --no-folding to avoid symlinking all of ~/.config
+mkdir -p "$HOME/.config/kitty"
+stow -v --adopt --no-folding -t "$HOME" kitty
 
 echo ""
 echo "Done! Open a new terminal or run: source ~/.bashrc"
