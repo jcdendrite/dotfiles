@@ -1,7 +1,7 @@
 ---
 name: code-review
 description: Principal engineer code review of changed/new code before presenting to user
-allowed-tools: Read, Grep, Glob
+allowed-tools: Read, Grep, Glob, Bash
 ---
 
 Review the code that was just written or modified. Act as a principal engineer reviewing a junior engineer's work. Be thorough but not pedantic.
@@ -206,3 +206,33 @@ section with entries like:
 Be specific about WHAT to check, not just WHO. "PE review recommended" is
 useless; "PE should verify the checkout flow in CheckoutPage.tsx still works
 after the new validation constraint" is actionable.
+
+## Step — Record review completion
+
+If the review is **clean** (no blockers, no unresolved critical findings,
+and you reviewed the currently staged changes), record it by running this
+command exactly once:
+
+```
+mkdir -p "$HOME/.claude/review-markers" && git diff --cached | sha256sum | awk '{print $1}' > "$HOME/.claude/review-markers/$(git rev-parse --show-toplevel | tr -d '\n' | sha256sum | awk '{print $1}')"
+```
+
+The `tr -d '\n'` is load-bearing: `git rev-parse` adds a trailing newline, and
+the hook computes the repo hash without it (`printf '%s' "$REPO_ROOT"`). Without
+`tr`, the marker lands at a path the hook never checks.
+
+This writes the hash of the currently staged diff into a user-global marker
+keyed by the repo's top-level path. The pre-commit hook recomputes the
+staged-diff hash at commit time and compares — match means the commit is
+allowed through. Re-staging any change invalidates the marker automatically.
+
+**Do NOT write the marker if:**
+
+- The review found blockers or unresolved critical findings
+- You reviewed a different state than what is currently staged
+- The user asked you to present findings without committing
+- You are not in a git repository
+
+If you skip it, say so explicitly so the user knows the commit gate will
+block until issues are fixed and the review is re-run on the final staged
+state.
