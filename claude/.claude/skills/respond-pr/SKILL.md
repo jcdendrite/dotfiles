@@ -4,17 +4,18 @@ description: Read and respond to PR review comments on the current branch's pull
 argument-hint: "[PR number]"
 ---
 
-TRIGGER when: the user asks to reply to, respond to, or address PR review comments, or when you need to post a reply to a GitHub PR comment thread. Always use this skill instead of manually calling the GitHub PR comments API.
+TRIGGER when: replying to PR review comments, OR posting any comment/reply to a GitHub pull request — even as part of a larger task. Enforces required attribution prefix.
 
 Fetch all review comments on the current branch's open pull request and address them.
 
 ## Steps
 
+0. **Enable hook bypass.** Run `mkdir -p ~/.claude && touch ~/.claude/.respond-pr-active`. The `require-respond-pr.sh` PreToolUse hook checks for this marker and lets this skill's own `gh` commands through while the marker is fresh (<60 minutes old). Without this step, every `gh api` call below will be blocked by the very gate that redirected you here.
 1. Identify the PR number for the current branch: `gh pr view --json number -q '.number'`
-2. Fetch **both** types of review comments:
+2. Fetch **all three** types of comments (Claude commonly fetches only the first and misses real feedback):
    - **Inline file comments:** `gh api repos/{owner}/{repo}/pulls/{number}/comments`
    - **Top-level review comments:** `gh api repos/{owner}/{repo}/pulls/{number}/reviews --jq '.[] | select(.body != "")'`
-   - Also check for **issue-level comments:** `gh api repos/{owner}/{repo}/issues/{number}/comments`
+   - **Issue-level comments:** `gh api repos/{owner}/{repo}/issues/{number}/comments`
 3. For each unresolved comment:
    - Read the referenced file and line to understand the context
    - Determine if it requires a code change, a reply, or both
@@ -22,6 +23,7 @@ Fetch all review comments on the current branch's open pull request and address 
    - If it's a question or discussion point, draft a clear response
 4. Post replies using the GitHub API with `in_reply_to` (use `-F` for integer IDs)
 5. Commit and push any code changes in a single commit
+6. **Remove the hook bypass marker:** `rm -f ~/.claude/.respond-pr-active`. If the skill errors out before reaching this step, don't manually clean up — the hook's 60-minute staleness cutoff handles orphaned markers automatically.
 
 ## Attribution
 
