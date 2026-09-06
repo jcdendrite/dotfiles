@@ -581,6 +581,44 @@ class TestRequireReadyForReview:
             == "allow"
         )
 
+    def test_push_of_commit_tree_built_oid_to_default_branch_allowed_with_no_open_pr(
+        self, isolated_home, repo_on_feature_branch, fake_gh_no_pr
+    ):
+        """Documented-behavior assertion: this hook's own default-branch and
+        no-open-PR bypasses key on the checked-out branch and its PR state,
+        never on the push destination or refspec, so a commit built with
+        `git commit-tree` -- which never reaches require-code-review.sh,
+        since that hook matches only `git commit` -- is allowed straight
+        onto the default branch's refspec. This pins the local half of the
+        gap `_lib_gate_diff_base`'s origin/<default> anchor accepts (its
+        soundness rests on this repo's PR-merge workflow, not on any local
+        control over what reaches the remote); it does not claim a
+        GitHub-side branch-protection setting is absent -- that is a
+        per-repository server setting outside this suite's reach."""
+        tree_oid = subprocess.run(
+            ["git", "-C", str(repo_on_feature_branch), "write-tree"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        payload_oid = subprocess.run(
+            [
+                "git", "-C", str(repo_on_feature_branch), "commit-tree", tree_oid,
+                "-m", "unreviewed payload",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert (
+            run_hook(
+                READY_FOR_REVIEW_HOOK,
+                bash_input(f"git push origin {payload_oid}:refs/heads/main", session_id="s"),
+                cwd=repo_on_feature_branch,
+            )
+            == "allow"
+        )
+
     def test_outside_git_repo_allowed(self, isolated_home, tmp_path):
         non_repo = tmp_path / "not-a-repo"
         non_repo.mkdir()

@@ -736,6 +736,284 @@ _lib_staged_diff_state() {
   esac
 }
 
+# _lib_git_inprogress_state REPO_ROOT [GITDIR]
+# Detects which git operation, if any, is paused mid-way in REPO_ROOT:
+# rebase, merge, cherry-pick, or revert. Precedence is checked in that
+# order -- a conflicted `rebase -i` can also leave a stale CHERRY_PICK_HEAD
+# from a `--rebase-merges` replay step, so rebase must win the tie, matching
+# git-state-safety/SKILL.md's own rule-of-thumb ordering.
+# GITDIR is optional: when the caller has already resolved
+# `--absolute-git-dir` for its own purposes (_lib_gate_diff_base does), pass
+# it here to skip this function's own resolution and avoid spawning git
+# twice for the same answer. Omit it to have this function resolve gitdir
+# itself.
+# Detection recipe per state (`git rev-parse --absolute-git-dir` resolved
+# once, then plain file tests against it -- not `git rev-parse --git-path`
+# per state, which would spawn git four times for the same answer):
+#   rebase       rebase-merge/ or rebase-apply/ dir exists
+#   merge        MERGE_HEAD exists
+#   cherry-pick  CHERRY_PICK_HEAD exists
+#   revert       REVERT_HEAD exists
+# --absolute-git-dir (not --git-dir) resolves a linked worktree's own
+# per-worktree gitdir rather than the shared main one, which is where these
+# four markers actually live.
+#
+# Tri-state via exit status, the same 0/1/2 contract
+# _lib_command_invokes_git_subcmd already establishes in this file:
+#   - exit 0, stdout = one of rebase/merge/cherry-pick/revert: that state is
+#     in progress.
+#   - exit 1, stdout empty: no in-progress state.
+#   - exit 2, stdout empty: the gitdir could not be resolved (or, when
+#     GITDIR was passed in, it was empty) -- the underlying _lib_capped call
+#     timed out, was killed, or git itself was missing. Callers MUST NOT
+#     treat this as "no state" -- see _lib_gate_diff_base below, whose
+#     safety property depends on this status never being read as a green
+#     light.
+_lib_git_inprogress_state() {
+  [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || return 2
+  local repo_root="$1"
+  local gitdir="${2:-}"
+  if [ -z "$gitdir" ]; then
+    if ! gitdir=$(_lib_capped git -C "$repo_root" rev-parse --absolute-git-dir 2>/dev/null); then
+      return 2
+    fi
+  fi
+  [ -n "$gitdir" ] || return 2
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then
+    printf '%s' rebase
+    return 0
+  fi
+  if [ -f "$gitdir/MERGE_HEAD" ]; then
+    printf '%s' merge
+    return 0
+  fi
+  if [ -f "$gitdir/CHERRY_PICK_HEAD" ]; then
+    printf '%s' cherry-pick
+    return 0
+  fi
+  if [ -f "$gitdir/REVERT_HEAD" ]; then
+    printf '%s' revert
+    return 0
+  fi
+  return 1
+}
+
+# _lib_gate_diff_base REPO_ROOT
+# Prints the tree-ish a commit-time gate should diff its staged content
+# against, in place of the index's implicit HEAD base -- so a gate that
+# hashes or scans `git diff --cached "$(_lib_gate_diff_base "$repo")"` sees
+# only content novel to the commit being made, even mid-merge.
+#
+# Outside an in-progress state (the overwhelming common case) this prints
+# nothing, and the call site issues plain `git diff --cached` with no base
+# argument. `git diff --cached HEAD` is deliberately not used as that "no
+# override" value: it fails on an unborn branch (no commits yet), where the
+# bare form succeeds.
+#
+# During a trusted in-progress state (see the anchor check below), this
+# computes the tree git's own automatic merge/rebase/cherry-pick/revert
+# machinery would have produced, via `git merge-tree --write-tree` (per
+# state, the exact base and tree-ish pair the state-detection table in
+# git-state-safety/SKILL.md's callers should use):
+#   rebase       merge-tree --write-tree --merge-base=REBASE_HEAD^ HEAD REBASE_HEAD
+#   merge        merge-tree --write-tree HEAD MERGE_HEAD
+#   cherry-pick  merge-tree --write-tree --merge-base=CHERRY_PICK_HEAD^ HEAD CHERRY_PICK_HEAD
+#   revert       merge-tree --write-tree --merge-base=REVERT_HEAD HEAD REVERT_HEAD^
+# `git diff --cached "$base"` against that tree is then exactly what the
+# author staged on top of it: conflict resolutions plus any hand edits,
+# with nothing the other side of the operation brought in untouched.
+#
+# Trust check, required before any of the above runs: presence of
+# MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge is not proof of
+# anything -- any of those is a plain gitdir file an ungated `git
+# update-ref` or `printf` can fabricate, pointing at arbitrary content. The
+# state's own OID (REBASE_HEAD/MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD's
+# content, unmodified) must first reach one of two anchors via `git
+# merge-base --is-ancestor`:
+#   - the resolved default remote-tracking branch (origin/<default>, via
+#     _lib_resolve_default_branch) -- content already reviewed upstream.
+#   - HEAD -- content already committed in this repo, which required
+#     passing this same gate at its own commit time.
+# Neither anchor is unforgeable; both are admitted because honestly
+# reaching either implies the content already passed review, and forging
+# either is no cheaper than building a commit with `commit-tree` and
+# merging it in cleanly -- a route that already reaches a commit with no
+# gate seeing it at all, forgery or not. Reaching neither anchor -- an
+# unrelated cherry-pick source, a garbage or dangling OID, an octopus
+# MERGE_HEAD (multi-line, never a valid single revision), or a
+# `--rebase-merges` replay of a merge commit where REBASE_HEAD^ would
+# silently resolve to the wrong parent -- all fall back to the empty base,
+# over-scoping rather than smuggling content past the hash.
+#
+# The trust-anchor check above is also the reason state_oid must be
+# shape-validated (a bare 40- or 64-hex-char string, git's two supported OID
+# lengths) before this function passes it as a positional argument to any
+# `git merge-base`/`merge-tree` invocation: state_oid comes from a plain
+# gitdir file, not from git itself, so nothing upstream of this function
+# guarantees it isn't attacker-controlled option-injection content (e.g. a
+# leading `--upload-pack=`) rather than a real OID.
+#
+# `merge-tree --write-tree`'s stdout is validated the same way regardless
+# of cause: take its first line (parameter expansion, matching
+# _lib_extract_git_subcmd's idiom, not a `head -1` fork) and require `git
+# rev-parse --verify --quiet "<line>^{tree}"` to succeed. A git older than
+# 2.38 rejecting `--write-tree` outright, or one accepting `--write-tree`
+# but rejecting `--merge-base=`, both fail this validation and fall back to
+# the empty base -- no version literal appears anywhere in this function.
+#
+# Tri-state via exit status, same contract as _lib_git_inprogress_state:
+#   - exit 0, stdout = a tree OID: an in-progress state was detected, its
+#     OID reached a trusted anchor, and the reference tree was computed.
+#   - exit 1, stdout empty: no in-progress state, or one whose OID reached
+#     no anchor, or a topology/git-version this design computes no base
+#     for. This is the correct answer, not a degraded one.
+#   - exit 2, stdout empty: undetermined -- a capped git call inside
+#     detection or tree computation timed out, was killed, or its binary
+#     was missing (distinguished from an ordinary git failure by exit codes
+#     124/125/126/127/137, `timeout(1)`'s own documented set for "the
+#     wrapped command did not run to completion normally", as opposed to
+#     git's own exit codes for an ordinary negative answer).
+# "exit 2 => empty stdout" is load-bearing: every caller consumes stdout
+# unconditionally regardless of exit status, so a partial or candidate OID
+# escaping on a kill path would otherwise be consumed as a real base and
+# would narrow an authorization hash on nobody's authority. No caller
+# changes its allow/deny decision on status 2 alone -- it denies (or
+# allows, per its own existing fail posture) on the same empty-base
+# over-gating it already applies to status 1, and may additionally name the
+# undetermined base in its own deny message.
+#
+# The trust-anchor check (`git merge-base --is-ancestor`) is exempt from
+# the above status-2 distinction: any non-zero exit from it -- including
+# one driven by the same cap -- is treated identically as "not trusted",
+# per `git merge-base --is-ancestor`'s own documented contract (0 ancestor,
+# non-zero otherwise, including an unresolvable OID). Collapsing that
+# call's failure modes is safe because its only effect either way is the
+# conservative empty-base fallback that status 1 already produces.
+_lib_gate_diff_base() {
+  [ "$#" -eq 1 ] || return 2
+  local repo_root="$1"
+
+  local gitdir
+  gitdir=$(_lib_capped git -C "$repo_root" rev-parse --absolute-git-dir 2>/dev/null) || return 2
+  [ -n "$gitdir" ] || return 2
+
+  local state state_status
+  state=$(_lib_git_inprogress_state "$repo_root" "$gitdir")
+  state_status=$?
+  [ "$state_status" -eq 2 ] && return 2
+  [ "$state_status" -eq 1 ] && return 1
+
+  local ref_file
+  case "$state" in
+    rebase) ref_file="REBASE_HEAD" ;;
+    merge) ref_file="MERGE_HEAD" ;;
+    cherry-pick) ref_file="CHERRY_PICK_HEAD" ;;
+    revert) ref_file="REVERT_HEAD" ;;
+    *) return 2 ;;
+  esac
+  [ -f "$gitdir/$ref_file" ] || return 1
+  local state_oid
+  state_oid=$(_lib_capped cat "$gitdir/$ref_file" 2>/dev/null)
+  [ -n "$state_oid" ] || return 1
+  [[ "$state_oid" =~ ^[0-9a-f]{40}$ ]] || [[ "$state_oid" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  local default_branch anchor_reached=1
+  default_branch=$(_lib_resolve_default_branch "$repo_root")
+  if [ -n "$default_branch" ] \
+    && _lib_capped git -C "$repo_root" merge-base --is-ancestor "$state_oid" "origin/$default_branch" >/dev/null 2>&1
+  then
+    anchor_reached=0
+  elif _lib_capped git -C "$repo_root" merge-base --is-ancestor "$state_oid" HEAD >/dev/null 2>&1; then
+    anchor_reached=0
+  fi
+  [ "$anchor_reached" -eq 0 ] || return 1
+
+  local tree_out tree_status
+  case "$state" in
+    merge)
+      tree_out=$(_lib_capped git -C "$repo_root" merge-tree --write-tree HEAD "$state_oid" 2>/dev/null)
+      tree_status=$?
+      ;;
+    rebase | cherry-pick)
+      tree_out=$(_lib_capped git -C "$repo_root" merge-tree --write-tree "--merge-base=${state_oid}^" HEAD "$state_oid" 2>/dev/null)
+      tree_status=$?
+      ;;
+    revert)
+      tree_out=$(_lib_capped git -C "$repo_root" merge-tree --write-tree "--merge-base=${state_oid}" HEAD "${state_oid}^" 2>/dev/null)
+      tree_status=$?
+      ;;
+  esac
+  case "$tree_status" in
+    124 | 125 | 126 | 127 | 137) return 2 ;;
+  esac
+  # tree_status itself is not the validation signal: `merge-tree
+  # --write-tree` exits 1 (not 0) whenever the merge it computed conflicts
+  # -- the expected, common case here, since resolving that conflict is the
+  # whole reason this function exists -- while still writing a valid tree
+  # (with embedded conflict markers) on its first stdout line. Whether that
+  # first line resolves to a real tree is the actual check, below.
+  local tree_oid="${tree_out%%$'\n'*}"
+  [ -n "$tree_oid" ] || return 1
+
+  _lib_capped git -C "$repo_root" rev-parse --verify --quiet "${tree_oid}^{tree}" >/dev/null 2>&1
+  local verify_status=$?
+  case "$verify_status" in
+    124 | 125 | 126 | 127 | 137) return 2 ;;
+  esac
+  [ "$verify_status" -eq 0 ] || return 1
+
+  printf '%s' "$tree_oid"
+}
+
+# _lib_staged_diff_hash REPO_ROOT BASE [PATHSPEC...]
+# Shared body behind every content-addressed marker preimage and round-state
+# value in this file and in scripts/marker.sh: sha256 of `git diff --cached`,
+# restricted to PATHSPEC when given. BASE is already resolved by the caller
+# (typically via _lib_gate_diff_base) -- this function has no way to
+# recompute one, which is deliberate: the write side (marker.sh) and every
+# read side must hash byte-identical input, and threading an
+# already-resolved value through the signature makes that structural rather
+# than a discipline each of the seven call sites has to remember.
+# BASE empty means no override: this runs plain `git diff --cached
+# [-- PATHSPEC...]`. BASE non-empty means `git diff --cached "$BASE"
+# [-- PATHSPEC...]`.
+# Two-outcome contract: exit 0 with the hex digest on stdout, or exit 1 with
+# empty stdout when git or sha256sum failed or was killed. sha256 of even an
+# empty diff is a non-empty 64-hex digest, so stdout alone can't distinguish
+# "nothing staged" from a failed pipeline -- what actually distinguishes them
+# is the capped `git diff` call's own exit status, captured via
+# `${PIPESTATUS[0]}` in the same command substitution immediately after the
+# pipeline runs (before any later command in that subshell can overwrite
+# it): any nonzero status there -- an ordinary git error or a cap kill
+# (124/125/126/127/137) alike -- fails this closed regardless of whether
+# sha256sum/awk still produced output downstream. Callers must fail closed
+# on exit 1, the same posture _lib_active_plan_hash and
+# _lib_reviewer_round_state_value already document for this class of
+# failure.
+_lib_staged_diff_hash() {
+  [ "$#" -ge 2 ] || return 1
+  local repo_root="$1" base="$2"
+  shift 2
+  local out git_status digest
+  if [ -n "$base" ]; then
+    out=$(
+      _lib_capped git -C "$repo_root" diff --cached "$base" -- "$@" 2>/dev/null | sha256sum | awk '{print $1}'
+      printf '\n%s' "${PIPESTATUS[0]}"
+    )
+  else
+    out=$(
+      _lib_capped git -C "$repo_root" diff --cached -- "$@" 2>/dev/null | sha256sum | awk '{print $1}'
+      printf '\n%s' "${PIPESTATUS[0]}"
+    )
+  fi
+  git_status="${out##*$'\n'}"
+  digest="${out%$'\n'*}"
+  digest="${digest%$'\n'}"
+  [ "$git_status" -eq 0 ] || return 1
+  [ -n "$digest" ] || return 1
+  printf '%s' "$digest"
+}
+
 # _lib_is_repo_plan_file REPO_ROOT ABS_PATH
 # Both arguments must already be _lib_realpath_m-normalized by the caller --
 # the same precondition the agent-reviews/ check in require-plan-review.sh
@@ -1033,6 +1311,91 @@ _lib_command_invokes_git_subcmd() {
     fi
   done <<< "$fragments"
   return 1
+}
+
+# Shape sets shared between _lib_command_concludes_commit and
+# _lib_command_concludes_marker_gated_commit below, and between the two
+# public wrappers, via their one shared private matcher -- so the decision
+# of which verbs' `--continue` form concludes a commit is written once, not
+# duplicated across two independently-maintained regexes.
+_LIB_CONTINUE_VERBS_ALL="merge rebase cherry-pick revert"
+_LIB_CONTINUE_VERBS_MARKER_GATED="merge cherry-pick revert"
+
+# _lib_command_concludes_commit_shape COMMAND VERBS
+# Private. True iff any fragment of COMMAND is `git commit` (in any form
+# _lib_command_invokes_git_subcmd already recognizes), or `git <verb>
+# --continue` for a verb in the whitespace-separated VERBS list. A clean
+# merge, rebase, or cherry-pick creates its commit inside the initiating
+# command with no separate `git commit` call, so this is the only PreToolUse
+# shape a conflict-resolution commit takes.
+# `--continue` must be one of the matched verb's own arguments, not merely
+# present somewhere else in COMMAND -- `_lib_extract_git_subcmd_args` is
+# checked per matching fragment rather than grepping the whole command
+# string, so `git rebase origin/main && echo --continue` does not match.
+# Tri-state via exit status, same 0/1/2 contract as
+# _lib_command_invokes_git_subcmd, which this delegates the `commit` check
+# to directly.
+_lib_command_concludes_commit_shape() {
+  [ "$#" -eq 2 ] || return 2
+  local command="$1" verbs="$2"
+  local command_unquoted fragments fragment
+  command_unquoted=$(_lib_strip_shell_quotes "$command") || return 2
+  fragments=$(_lib_split_fragments "$command_unquoted") || return 2
+  local subcmd verb is_continue_verb arg
+  while IFS= read -r fragment; do
+    [ -z "$fragment" ] && continue
+    _lib_fragment_invokes_git "$fragment" || continue
+    subcmd=$(_lib_extract_git_subcmd "$fragment")
+    if [ "$subcmd" = commit ]; then
+      return 0
+    fi
+    is_continue_verb=false
+    for verb in $verbs; do
+      if [ "$subcmd" = "$verb" ]; then
+        is_continue_verb=true
+        break
+      fi
+    done
+    $is_continue_verb || continue
+    while IFS= read -r arg; do
+      if [ "$arg" = --continue ]; then
+        return 0
+      fi
+    done < <(_lib_extract_git_subcmd_args "$fragment")
+  done <<< "$fragments"
+  return 1
+}
+
+# _lib_command_concludes_commit COMMAND
+# Tri-state, true for `git commit` and for `git <merge|rebase|cherry-pick|
+# revert> --continue` -- the full set of PreToolUse-visible shapes that
+# conclude one of those four operations with new content. Shared by every
+# gate whose recourse on a bad commit is mechanical (unstage a value,
+# shorten a file, remove a session key) rather than a review, so narrowing
+# this predicate to skip a verb would silently disarm those gates for that
+# verb's `--continue` form. See _lib_command_concludes_marker_gated_commit
+# below for the narrower sibling used by the two gates whose recourse is a
+# review.
+_lib_command_concludes_commit() {
+  [ "$#" -eq 1 ] || return 2
+  _lib_command_concludes_commit_shape "$1" "$_LIB_CONTINUE_VERBS_ALL"
+}
+
+# _lib_command_concludes_marker_gated_commit COMMAND
+# Tri-state, identical to _lib_command_concludes_commit above except that
+# `git rebase --continue` does not match. REBASE_HEAD cannot reach a trusted
+# anchor in the ordinary case (see _lib_gate_diff_base), so gating a review
+# marker on it would mean demanding a full review at every conflicted step
+# of a rebase against content that, for the most part, already passed
+# review at its own original commit time. The two gates that consume this
+# narrower predicate still deny an ordinary `git commit` made mid-rebase
+# without `--continue`, and the five gates that consume the broad predicate
+# above stay armed on `git rebase --continue` -- this predicate narrows
+# review-marker enforcement specifically, not rebase's overall gate
+# coverage.
+_lib_command_concludes_marker_gated_commit() {
+  [ "$#" -eq 1 ] || return 2
+  _lib_command_concludes_commit_shape "$1" "$_LIB_CONTINUE_VERBS_MARKER_GATED"
 }
 
 # Print a tool fragment's subcommand-word sequence, one word per line, after

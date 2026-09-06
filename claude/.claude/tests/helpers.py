@@ -752,10 +752,366 @@ def marker_path(
 
 
 def staged_diff_hash(repo: Path) -> str:
+    """The plain HEAD-relative preimage: `git diff --cached` with no base
+    override. This is today's production recipe, and stays exactly this
+    outside any in-progress git state (merge/rebase/cherry-pick/revert),
+    where _lib_gate_diff_base resolves no base and the real hooks issue
+    this identical command. See staged_diff_hash_at_base() below for the
+    base-relative oracle used inside a trusted in-progress state -- this
+    function is deliberately not extended to take a base, since the
+    marker-invalidation tests need exactly this old recipe to build an
+    old-preimage marker."""
     diff = subprocess.run(
         ["git", "diff", "--cached"], cwd=repo, capture_output=True, check=True
     ).stdout
     return hashlib.sha256(diff).hexdigest()
+
+
+def staged_diff_hash_at_base(repo: Path, base: str) -> str:
+    """Independent oracle for a base-relative marker preimage: computes
+    `git diff --cached <base>` directly in Python rather than by calling
+    the production `_lib_staged_diff_hash`/`_lib_gate_diff_base` shell
+    functions under test -- a test seeding a marker via the function it is
+    testing would only prove the function agrees with itself, not that its
+    output is correct (see write_plan_review_marker's docstring below for
+    the same caution applied to a different marker kind)."""
+    diff = subprocess.run(
+        ["git", "diff", "--cached", base], cwd=repo, capture_output=True, check=True
+    ).stdout
+    return hashlib.sha256(diff).hexdigest()
+
+
+def _run_git(repo: Path, *args: str) -> str:
+    """Run a git subcommand in `repo`, returning stdout. Raises on failure --
+    for the failure-is-expected calls in the in-progress-state builders
+    below (a merge/rebase/cherry-pick/revert whose whole point is to
+    conflict), use subprocess.run directly and assert on the returncode."""
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout
+
+
+def _current_branch(repo: Path) -> str:
+    return _run_git(repo, "symbolic-ref", "--short", "HEAD").strip()
+
+
+def _seed_tracked_file(repo: Path, file_name: str, content: str = "base\n") -> Path:
+    """Ensure `file_name` exists, tracked, and committed in `repo`, so a
+    conflict-building fixture has a common baseline both diverging sides
+    can edit differently -- an add/add conflict (both sides create the file
+    independently) exercises different git machinery than the
+    content-conflict shape these fixtures need. Idempotent: does nothing if
+    the file is already tracked."""
+    target = repo / file_name
+    if not target.exists():
+        target.write_text(content)
+        _run_git(repo, "add", file_name)
+        _run_git(repo, "commit", "-qm", f"seed {file_name}")
+    return target
+
+
+def bare_remote_with_default_branch(
+    tmp_path: Path,
+    branch: str = "main",
+    file_name: str = "f",
+    file_content: str = "a\n",
+) -> tuple[Path, Path]:
+    """Build a bare 'origin' repo and a clone checked out on `branch`, with
+    origin/HEAD set and one shared commit -- the bare-remote-plus-clone
+    shape test_check_branch_divergence.py's bare_remote/feature_clone
+    pytest fixtures already establish, generalized to a plain function so
+    every test file needing a pushable remote (the trusted/untrusted-anchor
+    tests here, and require-ready-for-review.sh's push-anchor test) can
+    call it directly rather than duplicating the construction. Returns
+    (bare_remote, clone)."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", branch, str(bare)], check=True, capture_output=True
+    )
+    seed = tmp_path / "_bare_remote_seed"
+    seed.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", branch, str(seed)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=seed, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=seed, check=True)
+    (seed / file_name).write_text(file_content)
+    subprocess.run(["git", "add", file_name], cwd=seed, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=seed, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=seed, check=True)
+    subprocess.run(["git", "push", "-q", "origin", branch], cwd=seed, check=True)
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", str(bare), str(clone)], check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=clone, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=clone, check=True)
+    subprocess.run(["git", "remote", "set-head", "origin", branch], cwd=clone, check=True)
+    return bare, clone
+
+
+def push_conflicting_edit_to_origin(
+    tmp_path: Path, bare: Path, file_name: str, content: str, branch: str = "main"
+) -> None:
+    """Push a new commit editing `file_name` to `bare`'s default branch from
+    a throwaway clone, independent of any other clone's own worktree -- the
+    "someone else pushed while I was working" shape a real sync merge
+    needs, and the shape test_check_branch_divergence.py's
+    repo_behind_conflict fixture already establishes. Does not touch any
+    other clone; callers run `git fetch origin` there afterward to see the
+    new origin/<branch> tip."""
+    push_clone = tmp_path / f"_push_{branch}_{abs(hash(content))}"
+    subprocess.run(
+        ["git", "clone", "-q", str(bare), str(push_clone)], check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=push_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=push_clone, check=True)
+    (push_clone / file_name).write_text(content)
+    subprocess.run(["git", "add", file_name], cwd=push_clone, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", f"origin edits {file_name}"], cwd=push_clone, check=True
+    )
+    subprocess.run(["git", "push", "-q", "origin", branch], cwd=push_clone, check=True)
+
+
+def build_conflicted_merge(repo: Path, *, file_name: str = "f") -> str:
+    """Build a real conflicted two-way merge inside `repo`: branch "theirs"
+    off the checked-out branch, edit `file_name` differently on each side,
+    then `git merge theirs` on the original branch. Leaves MERGE_HEAD and
+    unresolved conflict markers staged. `repo` must already have a
+    configured user.email/user.name. Returns the merged-in branch's tip
+    oid -- MERGE_HEAD's expected content."""
+    base_branch = _current_branch(repo)
+    target = _seed_tracked_file(repo, file_name)
+    _run_git(repo, "checkout", "-qb", "theirs")
+    target.write_text("theirs-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", f"theirs edits {file_name}")
+    theirs_oid = _run_git(repo, "rev-parse", "HEAD").strip()
+    _run_git(repo, "checkout", "-q", base_branch)
+    target.write_text("ours-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", f"ours edits {file_name}")
+    result = subprocess.run(
+        ["git", "merge", "-q", "theirs"], cwd=repo, capture_output=True, text=True
+    )
+    assert result.returncode != 0, (
+        f"expected merge conflict, got: {result.stdout}{result.stderr}"
+    )
+    assert (repo / ".git" / "MERGE_HEAD").exists(), "merge did not leave MERGE_HEAD"
+    return theirs_oid
+
+
+def build_conflicted_cherry_pick(repo: Path, *, file_name: str = "f") -> str:
+    """Build a real conflicted cherry-pick inside `repo`: branch "source"
+    off the checked-out branch, commit a conflicting edit to `file_name` on
+    each side, then `git cherry-pick` the source commit back onto the
+    original branch. Leaves CHERRY_PICK_HEAD and unresolved conflict
+    markers staged. Returns the cherry-picked commit's oid -- CHERRY_PICK_HEAD's
+    expected content."""
+    base_branch = _current_branch(repo)
+    target = _seed_tracked_file(repo, file_name)
+    _run_git(repo, "checkout", "-qb", "source")
+    target.write_text("source-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", f"source edits {file_name}")
+    source_oid = _run_git(repo, "rev-parse", "HEAD").strip()
+    _run_git(repo, "checkout", "-q", base_branch)
+    target.write_text("base-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", f"base edits {file_name}")
+    result = subprocess.run(
+        ["git", "cherry-pick", source_oid], cwd=repo, capture_output=True, text=True
+    )
+    assert result.returncode != 0, (
+        f"expected cherry-pick conflict, got: {result.stdout}{result.stderr}"
+    )
+    assert (repo / ".git" / "CHERRY_PICK_HEAD").exists(), "cherry-pick did not leave CHERRY_PICK_HEAD"
+    return source_oid
+
+
+def build_conflicted_revert(repo: Path, *, file_name: str = "f") -> str:
+    """Build a real conflicted revert inside `repo`: commit A introduces an
+    edit to `file_name`, commit B further edits the same region, then
+    `git revert A`. Reverting the tip essentially never conflicts, so this
+    three-commit shape is required to exercise the conflicting case. Leaves
+    REVERT_HEAD and unresolved conflict markers staged. Returns commit A's
+    oid -- REVERT_HEAD's expected content."""
+    target = _seed_tracked_file(repo, file_name)
+    target.write_text("A-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", "commit A")
+    commit_a = _run_git(repo, "rev-parse", "HEAD").strip()
+    target.write_text("B-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", "commit B")
+    result = subprocess.run(
+        ["git", "revert", "--no-edit", commit_a], cwd=repo, capture_output=True, text=True
+    )
+    assert result.returncode != 0, (
+        f"expected revert conflict, got: {result.stdout}{result.stderr}"
+    )
+    assert (repo / ".git" / "REVERT_HEAD").exists(), "revert did not leave REVERT_HEAD"
+    return commit_a
+
+
+def build_conflicted_rebase(
+    repo: Path, *, file_name: str = "f", interactive: bool = False
+) -> str:
+    """Build a real conflicted rebase inside `repo`, non-interactive by
+    default: branch "upstream" off the checked-out branch, edit
+    `file_name` differently on each side, then rebase the original branch
+    onto "upstream". Returns control at the pre-resolution checkpoint --
+    the index carries genuine stage 1/2/3 entries for `file_name` and the
+    conflict is not yet resolved -- with the replayed commit's oid
+    (REBASE_HEAD's expected content). Call resolve_conflicted_rebase() to
+    advance to the post-resolution, staged checkpoint.
+
+    `interactive=True` runs `git -c sequence.editor=true rebase -i
+    upstream` instead: an interactive rebase whose todo list is accepted
+    unmodified. Unlike the plain form, git implements each interactive
+    "pick" step via the same code path as cherry-pick, so this leaves a
+    CHERRY_PICK_HEAD alongside rebase-merge/ while paused -- the fixture
+    the state-detection precedence order (rebase before cherry-pick) is
+    verified against."""
+    base_branch = _current_branch(repo)
+    target = _seed_tracked_file(repo, file_name)
+    _run_git(repo, "checkout", "-qb", "upstream")
+    target.write_text("upstream-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", f"upstream edits {file_name}")
+    _run_git(repo, "checkout", "-q", base_branch)
+    target.write_text("feature-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", f"feature edits {file_name}")
+    feature_tip = _run_git(repo, "rev-parse", "HEAD").strip()
+
+    cmd = (
+        ["git", "-c", "sequence.editor=true", "rebase", "-i", "upstream"]
+        if interactive
+        else ["git", "rebase", "upstream"]
+    )
+    result = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+    assert result.returncode != 0, (
+        f"expected rebase conflict, got: {result.stdout}{result.stderr}"
+    )
+    gitdir = repo / ".git"
+    assert (gitdir / "rebase-merge").is_dir() or (gitdir / "rebase-apply").is_dir(), (
+        "rebase did not leave rebase-merge/ or rebase-apply/"
+    )
+    # Whether the installed git writes REBASE_HEAD is asserted, not assumed
+    # -- git's older apply-based backend (rebase-apply/) predates
+    # REBASE_HEAD, so this is only guaranteed on the merge-based backend
+    # (the default since git 2.26) that both the plain and interactive
+    # forms exercised here use.
+    assert (gitdir / "REBASE_HEAD").exists(), "rebase did not leave REBASE_HEAD"
+    return feature_tip
+
+
+def resolve_conflicted_rebase(
+    repo: Path, *, file_name: str = "f", resolution: str = "resolved\n"
+) -> None:
+    """Advance a build_conflicted_rebase() fixture to the post-resolution,
+    staged checkpoint: write `resolution` to `file_name` and `git add` it,
+    leaving the rebase paused with a clean, staged resolution ready for
+    `git rebase --continue`."""
+    (repo / file_name).write_text(resolution)
+    _run_git(repo, "add", file_name)
+
+
+def build_octopus_merge_conflict(repo: Path, *, file_name: str = "f") -> None:
+    """Forge a genuine multi-line MERGE_HEAD naming two real, divergent
+    commits. git's own octopus merge strategy aborts outright on any
+    conflicting step rather than leaving a resolvable state to fix by
+    hand -- confirmed empirically: `git merge b1 b2` against branches
+    diverged from a shared base and conflicting on the same file exits
+    nonzero with no MERGE_HEAD left at all, unlike the two-line MERGE_HEAD
+    plus ordinary conflict markers a two-parent merge leaves. Producing
+    this on-disk shape -- which the OID-validation code must still handle
+    defensively -- means writing MERGE_HEAD directly, naming two real
+    commits so the ancestry check this fixture exercises runs against
+    genuine objects rather than fabricated ones."""
+    base_branch = _current_branch(repo)
+    target = _seed_tracked_file(repo, file_name)
+    base_sha = _run_git(repo, "rev-parse", "HEAD").strip()
+    oids = []
+    for branch, content in (("b1", "b1-edit\n"), ("b2", "b2-edit\n")):
+        _run_git(repo, "checkout", "-qb", branch, base_sha)
+        target.write_text(content)
+        _run_git(repo, "add", file_name)
+        _run_git(repo, "commit", "-qm", f"{branch} edits {file_name}")
+        oids.append(_run_git(repo, "rev-parse", "HEAD").strip())
+    _run_git(repo, "checkout", "-q", base_branch)
+    (repo / ".git" / "MERGE_HEAD").write_text("\n".join(oids) + "\n")
+
+
+def build_rebase_merges_replay_conflict(repo: Path, *, file_name: str = "f") -> None:
+    """Build a `git rebase --rebase-merges upstream` replay that conflicts
+    while reconstructing a merge commit, so REBASE_HEAD names that merge
+    commit. This is the topology where REBASE_HEAD^ would silently resolve
+    to parent 1 rather than erroring.
+
+    `upstream` edits `file_name`. `side` and `feature` both edit a second
+    file, `second_file_name`, differently, so each replays cleanly onto
+    `upstream` individually -- `upstream` never touches that file. The
+    conflict surfaces only when --rebase-merges reconstructs the merge step
+    combining `side` and `feature`: this fixture replays, by hand, the same
+    conflict `feature`'s own merge of `side` hit originally. A conflict
+    placed directly in `file_name` instead would surface during an earlier
+    individual pick step and never reach the merge reconstruction at all --
+    confirmed empirically."""
+    second_file_name = f"{file_name}2"
+    target = _seed_tracked_file(repo, file_name)
+    second_target = repo / second_file_name
+    second_target.write_text("base\n")
+    _run_git(repo, "add", second_file_name)
+    _run_git(repo, "commit", "-qm", f"seed {second_file_name}")
+    base_sha = _run_git(repo, "rev-parse", "HEAD").strip()
+
+    _run_git(repo, "checkout", "-qb", "upstream", base_sha)
+    target.write_text("upstream-edit\n")
+    _run_git(repo, "add", file_name)
+    _run_git(repo, "commit", "-qm", f"upstream edits {file_name}")
+
+    _run_git(repo, "checkout", "-qb", "side", base_sha)
+    second_target.write_text("side-edit\n")
+    _run_git(repo, "add", second_file_name)
+    _run_git(repo, "commit", "-qm", f"side edits {second_file_name}")
+
+    _run_git(repo, "checkout", "-qb", "feature", base_sha)
+    second_target.write_text("feature-edit\n")
+    _run_git(repo, "add", second_file_name)
+    _run_git(repo, "commit", "-qm", f"feature edits {second_file_name}")
+    merge_result = subprocess.run(
+        ["git", "merge", "--no-ff", "-q", "side"], cwd=repo, capture_output=True, text=True
+    )
+    assert merge_result.returncode != 0, (
+        f"expected feature's own merge of side to conflict, got: "
+        f"{merge_result.stdout}{merge_result.stderr}"
+    )
+    second_target.write_text("resolved\n")
+    _run_git(repo, "add", second_file_name)
+    subprocess.run(
+        ["git", "commit", "--no-edit", "-q"],
+        cwd=repo, check=True, capture_output=True,
+        env={**os.environ, "GIT_EDITOR": "true"},
+    )
+    merge_oid = _run_git(repo, "rev-parse", "HEAD").strip()
+
+    result = subprocess.run(
+        ["git", "rebase", "--rebase-merges", "upstream"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert result.returncode != 0, (
+        f"expected rebase --rebase-merges conflict, got: {result.stdout}{result.stderr}"
+    )
+    assert (repo / ".git" / "rebase-merge").is_dir(), "rebase did not leave rebase-merge/"
+    rebase_head = _run_git(repo, "rev-parse", "REBASE_HEAD").strip()
+    assert rebase_head == merge_oid, (
+        "expected REBASE_HEAD to name the original merge commit, not an "
+        "individually-replayed side commit"
+    )
+    parents = _run_git(repo, "rev-list", "--parents", "-n", "1", rebase_head).split()
+    assert len(parents) >= 3, "expected REBASE_HEAD to be a merge commit with 2+ parents"
 
 
 def write_marker(
