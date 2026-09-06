@@ -5417,6 +5417,27 @@ class TestGateDiffBaseUntrustedAnchor:
         assert result.returncode == 1
         assert result.stdout == ""
 
+    @pytest.mark.parametrize("state", ["rebase", "merge", "cherry-pick", "revert"])
+    def test_resolvable_non_hex_state_ref_falls_back(
+        self, tmp_path: Path, state: str
+    ) -> None:
+        """A state ref file is plain, unauthenticated content anyone with
+        filesystem access could write directly -- not proof of a real git
+        operation. `HEAD` is syntactically valid and trivially its own
+        ancestor, so without state_oid's own shape validation it would
+        sail past the anchor check and reach merge-tree, producing a real
+        tree OID (rc=0) instead of falling back. A `--flag`-shaped payload
+        would not discriminate here: git's own CLI parser already rejects
+        an unrecognized option in merge-base/merge-tree, independent of
+        state_oid's shape guard, so it can't prove the guard is
+        load-bearing."""
+        repo = tmp_path / "repo"
+        _init_repo_on_branch(repo, "main")
+        _forge_state_marker(repo / ".git", state, "HEAD")
+        result = _gate_diff_base(repo)
+        assert result.returncode == 1
+        assert result.stdout == ""
+
 
 class TestGateDiffBaseTopologyFallback:
     def test_octopus_merge_falls_back_to_empty_base(self, tmp_path: Path) -> None:
