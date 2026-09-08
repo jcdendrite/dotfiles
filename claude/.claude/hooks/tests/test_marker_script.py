@@ -16,15 +16,19 @@ from helpers import (
     SCRIPTS_DIR,
     TRAVERSAL_SESSION_ID,
     agent_input,
+    bare_remote_with_default_branch,
     bash_input,
+    edit_input,
     git_toplevel,
     head_sha,
     plan_review_marker_path,
     plant_traversal_canary,
+    push_conflicting_edit_to_origin,
     read_input,
     run_hook,
     skill_review_marker_path,
     staged_diff_hash,
+    staged_diff_hash_at_base,
     write_marker,
     write_plan_review_marker,
     write_skill_review_marker,
@@ -1360,6 +1364,269 @@ class TestMarkerWriteSatisfiesTheGate:
             )
             == "allow"
         )
+
+
+def _build_conflicted_merge_via_origin(tmp_path):
+    """Local copy of test_require_code_review.py's fixture of the same name
+    (DAMP test code): a conflicted merge whose MERGE_HEAD is trusted via the
+    origin/<default> anchor, resolved and staged."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    (clone / "f").write_text("ours-edit\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "ours edits f"], cwd=clone, check=True)
+    push_conflicting_edit_to_origin(tmp_path, bare, "f", "origin-edit\n")
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    (clone / "f").write_text("resolved\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    return clone
+
+
+def _merge_tree_base(repo):
+    """Local copy of test_require_code_review.py's helper of the same name:
+    independently computes the reference tree _lib_gate_diff_base's merge
+    row computes. The literal MERGE_HEAD OID (not the ref name) is passed --
+    git embeds a merge-tree argument's own textual form into the conflict
+    marker label, so the ref name would compute a byte-different tree than
+    production's `merge-tree --write-tree HEAD "$state_oid"`."""
+    merge_head_oid = (repo / ".git" / "MERGE_HEAD").read_text().strip()
+    out = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "HEAD", merge_head_oid],
+        cwd=repo, capture_output=True, text=True, check=False,
+    ).stdout
+    return out.strip().splitlines()[0]
+
+
+class TestMarkerScriptMergeAwareBase:
+    """marker.sh's `write code-review` and `status` arms thread
+    _lib_gate_diff_base's resolved base through _lib_staged_diff_hash, the
+    same base require-code-review.sh's read side resolves -- write and read
+    must agree byte-for-byte or a marker written mid-merge can never match."""
+
+    def test_write_code_review_marker_value_matches_independent_oracle(
+        self, isolated_home, tmp_path
+    ):
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        sid = "test-session-merge-write"
+        _seed_session(isolated_home, sid)
+        result = _run(["write", "code-review"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+
+        marker_dir = isolated_home / ".claude" / "code-review-markers"
+        files = list(marker_dir.iterdir())
+        assert len(files) == 1
+        base = _merge_tree_base(repo)
+        expected = staged_diff_hash_at_base(repo, base)
+        assert files[0].read_text().strip() == expected
+
+    def test_write_code_review_marker_opens_the_commit_gate_mid_merge(
+        self, isolated_home, tmp_path
+    ):
+        """Same round-trip proof as TestMarkerWriteSatisfiesTheGate above,
+        against a mid-merge repo rather than a plain one -- write and read
+        must agree on the base-relative recipe, not just the HEAD-relative
+        one."""
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        sid = "test-session-merge-roundtrip"
+        _seed_session(isolated_home, sid)
+
+        result = _run(["write", "code-review"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+
+        assert (
+            run_hook(
+                HOOKS_DIR / "require-code-review.sh",
+                bash_input("git commit -m roundtrip", session_id=sid),
+                cwd=repo,
+            )
+            == "allow"
+        )
+
+    def test_status_reports_live_mid_merge_for_base_relative_marker(
+        self, isolated_home, tmp_path
+    ):
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        sid = "test-session-merge-status"
+        _seed_session(isolated_home, sid)
+        base = _merge_tree_base(repo)
+        write_marker(
+            isolated_home, repo, staged_diff_hash_at_base(repo, base), session_id=sid
+        )
+        result = _run(["status"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+        assert "code-review: live" in result.stdout
+
+    def test_status_reports_historical_mid_merge_for_old_head_relative_marker(
+        self, isolated_home, tmp_path
+    ):
+        """A marker holding the plain HEAD-relative preimage must not read
+        as live mid-merge -- it covers upstream's whole contribution, not
+        just the resolution."""
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        sid = "test-session-merge-status-stale"
+        _seed_session(isolated_home, sid)
+        write_marker(isolated_home, repo, staged_diff_hash(repo), session_id=sid)
+        result = _run(["status"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+        assert "code-review: historical" in result.stdout
+
+
+def _build_conflicted_merge_via_origin_with_local_plan_edit(tmp_path):
+    """Merge fixture with a plan file edited only locally, post-merge and
+    unstaged -- upstream never touches it, so its merge-tree base content
+    equals HEAD's, and diffing the local edit against either base exercises
+    _lib_active_plan_hash's ordinary (non-empty active set) branch."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    plans_dir = clone / ".claude" / "plans"
+    plans_dir.mkdir(parents=True)
+    (plans_dir / "p.md").write_text("base plan\n")
+    subprocess.run(["git", "add", ".claude/plans/p.md"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed plan"], cwd=clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=clone, check=True)
+
+    (clone / "f").write_text("ours-edit\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "ours edits f"], cwd=clone, check=True)
+    push_conflicting_edit_to_origin(tmp_path, bare, "f", "origin-edit\n")
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    (clone / "f").write_text("resolved\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    (plans_dir / "p.md").write_text("locally edited plan\n")
+    return clone
+
+
+def _build_conflicted_merge_via_origin_with_upstream_plan_edit(tmp_path):
+    """Merge fixture with a plan file edited only upstream, before the
+    merge -- it auto-merges into the local worktree unchanged, so it reads
+    as active relative to plain HEAD (upstream's whole contribution) but not
+    relative to the trusted merge-tree base (already-reviewed content
+    excluded). Used to prove a HEAD-relative marker goes stale mid-merge."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    plans_dir = clone / ".claude" / "plans"
+    plans_dir.mkdir(parents=True)
+    (plans_dir / "p.md").write_text("base plan\n")
+    subprocess.run(["git", "add", ".claude/plans/p.md"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed plan"], cwd=clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=clone, check=True)
+
+    (clone / "f").write_text("ours-edit\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "ours edits f"], cwd=clone, check=True)
+
+    push_clone = tmp_path / "_push_upstream_plan_edit"
+    subprocess.run(
+        ["git", "clone", "-q", str(bare), str(push_clone)], check=True, capture_output=True
+    )
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=push_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=push_clone, check=True)
+    (push_clone / "f").write_text("origin-edit\n")
+    (push_clone / ".claude" / "plans" / "p.md").write_text("upstream edited plan\n")
+    subprocess.run(["git", "add", "f", ".claude/plans/p.md"], cwd=push_clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "origin edits f and p.md"], cwd=push_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=push_clone, check=True)
+
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    (clone / "f").write_text("resolved\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    return clone
+
+
+def _active_plan_hash_oracle(repo, active_files):
+    """Independent, non-shell reimplementation of _lib_active_plan_hash's
+    digest recipe (path, newline, per-file sha256, newline, concatenated
+    across active files and re-hashed) for a caller-supplied active file
+    list -- not derived by calling the function under test."""
+    combined = ""
+    for f in active_files:
+        file_hash = hashlib.sha256((repo / f).read_bytes()).hexdigest()
+        combined += f + "\n" + file_hash + "\n"
+    return hashlib.sha256(combined.encode()).hexdigest()
+
+
+class TestMarkerScriptMergeAwarePlanReviewBase:
+    """marker.sh's `write plan-review` and `status` arms thread
+    _lib_gate_diff_base's resolved base into _lib_active_plan_hash, the same
+    base require-plan-review.sh's read side resolves -- write and read must
+    agree byte-for-byte, or a plan-review marker written mid-merge can never
+    match. Mirrors TestMarkerScriptMergeAwareBase above for the plan-review
+    marker kind."""
+
+    def test_write_plan_review_marker_value_matches_independent_oracle(
+        self, isolated_home, tmp_path
+    ):
+        repo = _build_conflicted_merge_via_origin_with_local_plan_edit(tmp_path)
+        sid = "test-session-merge-plan-write"
+        _seed_session(isolated_home, sid)
+        result = _run(["write", "plan-review"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+
+        marker_dir = isolated_home / ".claude" / "plan-review-markers"
+        files = list(marker_dir.iterdir())
+        assert len(files) == 1
+        expected = _active_plan_hash_oracle(repo, [".claude/plans/p.md"])
+        assert files[0].read_text().strip() == expected
+
+    def test_write_plan_review_marker_opens_the_write_gate_mid_merge(
+        self, isolated_home, tmp_path
+    ):
+        """Same round-trip proof as TestMarkerScriptMergeAwareBase above,
+        against the plan-review marker kind: write and read must agree on
+        the base-relative recipe, not just the HEAD-relative one."""
+        repo = _build_conflicted_merge_via_origin_with_local_plan_edit(tmp_path)
+        sid = "test-session-merge-plan-roundtrip"
+        _seed_session(isolated_home, sid)
+
+        result = _run(["write", "plan-review"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+
+        assert (
+            run_hook(
+                HOOKS_DIR / "require-plan-review.sh",
+                {**edit_input(str(repo / "other.txt")), "session_id": sid},
+                cwd=repo,
+            )
+            == "allow"
+        )
+
+    def test_status_reports_live_mid_merge_for_base_relative_plan_marker(
+        self, isolated_home, tmp_path
+    ):
+        repo = _build_conflicted_merge_via_origin_with_local_plan_edit(tmp_path)
+        sid = "test-session-merge-plan-status"
+        _seed_session(isolated_home, sid)
+        base = _merge_tree_base(repo)
+        write_plan_review_marker(isolated_home, repo, sid, base=base)
+        result = _run(["status"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+        assert "plan-review: live" in result.stdout
+
+    def test_status_reports_historical_mid_merge_for_old_head_relative_plan_marker(
+        self, isolated_home, tmp_path
+    ):
+        """A marker holding the plain HEAD-relative preimage must not read
+        as live mid-merge -- it covers upstream's whole contribution to the
+        plan file, not just the local resolution."""
+        repo = _build_conflicted_merge_via_origin_with_upstream_plan_edit(tmp_path)
+        sid = "test-session-merge-plan-status-stale"
+        _seed_session(isolated_home, sid)
+        write_plan_review_marker(isolated_home, repo, sid)
+        result = _run(["status"], cwd=repo, home=isolated_home)
+        assert result.returncode == 0, result.stderr
+        assert "plan-review: historical" in result.stdout
 
 
 class TestMarkerScriptHonorsConfigDir:
@@ -3037,6 +3304,54 @@ class TestMarkerScriptCumulativeReview:
         result = _run(["clear-stale"], cwd=cumulative_diff_repo, home=isolated_home)
         assert result.returncode == 0, result.stderr
         assert subject_path.exists()
+
+
+class TestMarkerScriptStatusDiffBaseInvocationCount:
+    """`marker.sh status` resolves GATE_DIFF_BASE once and threads it into
+    both the code-review and plan-review values below it -- a resolution per
+    value would multiply the merge-tree cost for the same result (see the
+    `status)` case's own comment above GATE_DIFF_BASE's assignment)."""
+
+    SID = "test-session-status-diff-base-count"
+
+    def test_gate_diff_base_resolved_once_across_code_review_and_plan_review(
+        self, isolated_home, git_repo, tmp_path
+    ):
+        """_lib_gate_diff_base's own first git call --
+        `rev-parse --absolute-git-dir` -- is the proxy counted here: it runs
+        unconditionally on every _lib_gate_diff_base invocation, before any
+        state-dependent branching, so counting it counts calls to the
+        function itself."""
+        _seed_session(isolated_home, self.SID)
+        real_git = shutil.which("git")
+        stub_dir = tmp_path / "stub-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "git"
+        invocation_log = tmp_path / "git-absolute-git-dir-invocations"
+        stub.write_text(
+            '#!/bin/bash\n'
+            'for arg in "$@"; do\n'
+            '  if [ "$arg" = "--absolute-git-dir" ]; then\n'
+            f'    echo "$@" >> "{invocation_log}"\n'
+            '  fi\n'
+            'done\n'
+            f'exec {real_git} "$@"\n'
+        )
+        stub.chmod(0o755)
+
+        result = _run(
+            ["status"],
+            cwd=git_repo,
+            home=isolated_home,
+            extra_env={"PATH": f"{stub_dir}:{os.environ['PATH']}"},
+        )
+        assert result.returncode == 0, result.stderr
+        invocations = invocation_log.read_text().splitlines() if invocation_log.exists() else []
+        assert len(invocations) == 1, (
+            f"expected exactly one `--absolute-git-dir`-shaped git invocation "
+            f"(_lib_gate_diff_base resolved once, not once per value that "
+            f"consumes it), got: {invocations}"
+        )
 
 
 class TestMarkerScriptStatusActiveBypass:

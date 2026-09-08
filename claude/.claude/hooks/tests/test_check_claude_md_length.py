@@ -10,9 +10,12 @@ from pathlib import Path
 import pytest
 from helpers import (
     HOOKS_DIR,
+    bare_remote_with_default_branch,
     bash_input,
+    build_conflicted_rebase,
     build_path_without,
     edit_input,
+    resolve_conflicted_rebase,
     run_hook,
     run_hook_reason,
 )
@@ -873,4 +876,84 @@ class TestCheckClaudeMdLength:
         matcher, _ = matches[0]
         assert "Bash" in matcher, (
             f"check-claude-md-length.sh must be in a Bash matcher group; found: {matcher!r}"
+        )
+
+
+def _build_clean_merge_growing_claude_md(tmp_path: Path) -> Path:
+    """Local copy of test_check_skill_length.py's fixture of the same shape
+    (DAMP test code): a conflict-free merge where only upstream grows
+    CLAUDE.md past the limit, the clone's own commit touching an unrelated
+    file so the merge cannot fast-forward and leaves MERGE_HEAD."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    (clone / CLAUDE_MD_PATH).parent.mkdir(parents=True, exist_ok=True)
+    (clone / CLAUDE_MD_PATH).write_text(make_lines(190))
+    subprocess.run(["git", "add", CLAUDE_MD_PATH], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "add claude.md at 190"], cwd=clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=clone, check=True)
+
+    (clone / "own.txt").write_text("own\n")
+    subprocess.run(["git", "add", "own.txt"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "own edit"], cwd=clone, check=True)
+
+    push_clone = tmp_path / "push_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(push_clone)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=push_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=push_clone, check=True)
+    (push_clone / CLAUDE_MD_PATH).parent.mkdir(parents=True, exist_ok=True)
+    (push_clone / CLAUDE_MD_PATH).write_text(make_lines(250))
+    subprocess.run(["git", "add", CLAUDE_MD_PATH], cwd=push_clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "origin grows claude.md"], cwd=push_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=push_clone, check=True)
+
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "--no-commit", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    return clone
+
+
+def _build_conflicted_rebase_with_growing_claude_md(tmp_path: Path) -> Path:
+    """Local copy of test_check_skill_length.py's fixture of the same shape:
+    a conflicted rebase on an unrelated file, with CLAUDE.md separately
+    grown past the limit as part of the staged resolution."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / CLAUDE_MD_PATH).parent.mkdir(parents=True, exist_ok=True)
+    (repo / CLAUDE_MD_PATH).write_text(make_lines(100))
+    subprocess.run(["git", "add", CLAUDE_MD_PATH], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed claude.md at 100"], cwd=repo, check=True)
+
+    build_conflicted_rebase(repo)
+    resolve_conflicted_rebase(repo)
+    (repo / CLAUDE_MD_PATH).write_text(make_lines(250))
+    subprocess.run(["git", "add", CLAUDE_MD_PATH], cwd=repo, check=True)
+    return repo
+
+
+class TestCheckClaudeMdLengthMergeAwareBase:
+    """_lib_staged_length_gate's `old` comparison is measured against
+    _lib_gate_diff_base's resolved base, and mid-merge vs. mid-rebase differ
+    in which base gets used. Local mirror of
+    TestCheckSkillLengthMergeAwareBase -- the shared driver in _lib.sh means
+    both callers must show the same fixed defect and the same fix."""
+
+    def test_mid_merge_pure_upstream_growth_does_not_fail(self, isolated_home, tmp_path):
+        repo = _build_clean_merge_growing_claude_md(tmp_path)
+        assert (
+            run_hook(CHECK_CLAUDE_MD_LENGTH_HOOK, bash_input("git commit -m foo"), cwd=repo)
+            == "allow"
+        )
+
+    def test_mid_rebase_growth_past_mid_rebase_head_still_denies(
+        self, isolated_home, tmp_path
+    ):
+        repo = _build_conflicted_rebase_with_growing_claude_md(tmp_path)
+        assert (
+            run_hook(CHECK_CLAUDE_MD_LENGTH_HOOK, bash_input("git commit -m foo"), cwd=repo)
+            == "deny"
         )

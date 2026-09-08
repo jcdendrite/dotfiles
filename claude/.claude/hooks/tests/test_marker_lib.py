@@ -56,10 +56,14 @@ def _hash_diff_text(text: str) -> subprocess.CompletedProcess:
     )
 
 
-def _active_plan_hash(repo: Path, env_overrides: dict | None = None) -> str:
-    """Shell out to the real _lib_active_plan_hash against `repo`."""
+def _active_plan_hash(
+    repo: Path, base: str = "", env_overrides: dict | None = None
+) -> str:
+    """Shell out to the real _lib_active_plan_hash against `repo`. `base`
+    defaults to "" (no trusted in-progress state)."""
     result = subprocess.run(
-        ["bash", "-c", f'. "{LIB_SH}"; _lib_active_plan_hash "$1"', "_active_plan_hash", str(repo)],
+        ["bash", "-c", f'. "{LIB_SH}"; _lib_active_plan_hash "$1" "$2"',
+         "_active_plan_hash", str(repo), base],
         capture_output=True,
         text=True,
         check=True,
@@ -68,12 +72,15 @@ def _active_plan_hash(repo: Path, env_overrides: dict | None = None) -> str:
     return result.stdout.strip()
 
 
-def _active_plan_files(repo: Path, env_overrides: dict | None = None) -> subprocess.CompletedProcess:
+def _active_plan_files(
+    repo: Path, base: str = "", env_overrides: dict | None = None
+) -> subprocess.CompletedProcess:
     """Shell out to the real _lib_active_plan_files against `repo`, returning
     the raw CompletedProcess so callers can assert on exit status and stdout
-    together."""
+    together. `base` defaults to "" (no trusted in-progress state)."""
     return subprocess.run(
-        ["bash", "-c", f'. "{LIB_SH}"; _lib_active_plan_files "$1"', "_active_plan_files", str(repo)],
+        ["bash", "-c", f'. "{LIB_SH}"; _lib_active_plan_files "$1" "$2"',
+         "_active_plan_files", str(repo), base],
         capture_output=True,
         text=True,
         env={**os.environ, **(env_overrides or {})},

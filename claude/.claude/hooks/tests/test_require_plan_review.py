@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import textwrap
 import time
+from pathlib import Path
 
 import pytest
 from helpers import (
@@ -16,7 +17,9 @@ from helpers import (
     SCRIPTS_DIR,
     SKILLS_DIR,
     assert_gate_handles_traversal_session_id,
+    bare_remote_with_default_branch,
     bash_input,
+    build_conflicted_revert,
     edit_input,
     exitplanmode_input,
     extract_skill_command,
@@ -2449,6 +2452,290 @@ class TestPlanReviewSkillPlanModeFixture:
                 REQUIRE_PLAN_REVIEW_HOOK,
                 {**exitplanmode_input(plan_file_path=str(plan_mode_file)), "session_id": sid},
                 cwd=plan_review_repo,
+            )
+            == "allow"
+        )
+
+
+LIB_SH = HOOKS_DIR / "_lib.sh"
+
+
+def _active_plan_files(repo, env_overrides: dict | None = None) -> subprocess.CompletedProcess:
+    """Local copy of test_marker_lib.py's helper of the same name (DAMP
+    test code, per the neither-test-tree-imports-the-other convention):
+    shell out to the real _lib_active_plan_files against `repo`, resolving
+    _lib_gate_diff_base first so a mid-merge/rebase/cherry-pick/revert
+    fixture exercises the same base require-plan-review.sh/marker.sh would."""
+    return subprocess.run(
+        ["bash", "-c",
+         f'. "{LIB_SH}"; base=$(_lib_gate_diff_base "$1"); _lib_active_plan_files "$1" "$base"',
+         "_active_plan_files", str(repo)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, **(env_overrides or {})},
+    )
+
+
+def _make_git_rejecting_write_tree(bin_dir):
+    """Simulates git < 2.38: `merge-tree --write-tree` is rejected outright.
+    Every other subcommand proxies to the real git. Local copy of
+    test_lib.py's shim of the same name (DAMP test code, per CLAUDE.md's
+    named exception)."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "--write-tree" ]; then\n'
+        '    echo "error: unknown option \x60--write-tree\x60" >&2\n'
+        '    exit 129\n'
+        '  fi\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _make_git_rejecting_merge_base_flag(bin_dir):
+    """Simulates git 2.38-2.39: --write-tree is accepted but --merge-base=
+    is rejected. Local copy of test_lib.py's shim of the same name."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        '    --merge-base=*)\n'
+        '      echo "error: unknown option \x60--merge-base\x60" >&2\n'
+        '      exit 129\n'
+        '      ;;\n'
+        '  esac\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+class TestActivePlanFilesMergeAwareBase:
+    """_lib_active_plan_files diffs against _lib_gate_diff_base's resolved
+    base instead of the literal HEAD, so a plan file a trusted merge brought
+    in untouched is excluded from the active set."""
+
+    def test_mid_merge_omits_untouched_upstream_plan_reports_edited_one(
+        self, tmp_path
+    ):
+        bare, clone = bare_remote_with_default_branch(tmp_path)
+        plans_dir = clone / ".claude" / "plans"
+        plans_dir.mkdir(parents=True)
+        (plans_dir / "shared-plan.md").write_text("# shared plan\n\nbase content\n")
+        subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "seed shared plan"], cwd=clone, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=clone, check=True)
+
+        (plans_dir / "shared-plan.md").write_text("# shared plan\n\nours edit\n")
+        subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "ours edits shared plan"], cwd=clone, check=True)
+
+        push_clone = tmp_path / "push_clone"
+        subprocess.run(["git", "clone", "-q", str(bare), str(push_clone)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=push_clone, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=push_clone, check=True)
+        (push_clone / ".claude" / "plans" / "shared-plan.md").write_text(
+            "# shared plan\n\norigin edit\n"
+        )
+        (push_clone / ".claude" / "plans" / "upstream-only-plan.md").write_text(
+            "# upstream-only plan\n\nnever touched by ours\n"
+        )
+        subprocess.run(
+            ["git", "add", ".claude/plans/shared-plan.md", ".claude/plans/upstream-only-plan.md"],
+            cwd=push_clone, check=True,
+        )
+        subprocess.run(["git", "commit", "-qm", "origin edits shared plan, adds a new one"], cwd=push_clone, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=push_clone, check=True)
+
+        subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+        result = subprocess.run(
+            ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert (clone / ".git" / "MERGE_HEAD").exists()
+        (plans_dir / "shared-plan.md").write_text("# shared plan\n\nresolved\n")
+        subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=clone, check=True)
+
+        active = _active_plan_files(clone)
+        assert active.returncode == 0, active.stderr
+        active_files = active.stdout.splitlines()
+        assert ".claude/plans/shared-plan.md" in active_files
+        assert ".claude/plans/upstream-only-plan.md" not in active_files
+
+    def test_fallback_write_tree_rejected_behaves_like_today(self, tmp_path):
+        """`--write-tree` outright rejection (git < 2.38) must fall back to
+        diffing against literal HEAD -- exactly today's plain recipe --
+        rather than hanging or misreporting the active set."""
+        bare, clone = bare_remote_with_default_branch(tmp_path)
+        plans_dir = clone / ".claude" / "plans"
+        plans_dir.mkdir(parents=True)
+        (plans_dir / "shared-plan.md").write_text("# shared plan\n\nbase content\n")
+        subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "seed shared plan"], cwd=clone, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=clone, check=True)
+
+        (plans_dir / "shared-plan.md").write_text("# shared plan\n\nours edit\n")
+        subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "ours edits shared plan"], cwd=clone, check=True)
+
+        push_clone = tmp_path / "push_clone"
+        subprocess.run(["git", "clone", "-q", str(bare), str(push_clone)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=push_clone, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=push_clone, check=True)
+        (push_clone / ".claude" / "plans" / "shared-plan.md").write_text(
+            "# shared plan\n\norigin edit\n"
+        )
+        subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=push_clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "origin edits shared plan"], cwd=push_clone, check=True)
+        subprocess.run(["git", "push", "-q", "origin", "main"], cwd=push_clone, check=True)
+
+        subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+        result = subprocess.run(
+            ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert (clone / ".git" / "MERGE_HEAD").exists()
+        (plans_dir / "shared-plan.md").write_text("# shared plan\n\nresolved\n")
+        subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=clone, check=True)
+
+        bin_dir = tmp_path / "bin-fallback-write-tree"
+        _make_git_rejecting_write_tree(bin_dir)
+        active = _active_plan_files(
+            clone, env_overrides={"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        )
+        assert active.returncode == 0, active.stderr
+        assert ".claude/plans/shared-plan.md" in active.stdout.splitlines()
+
+    def test_fallback_merge_base_flag_rejected_behaves_like_today(self, tmp_path):
+        """The `--merge-base=` rejection band (git 2.38-2.39) only affects
+        the three states whose merge-tree call passes that flag -- rebase,
+        cherry-pick, revert, not merge -- so this needs its own fixture: a
+        conflicted revert of a plan file, trusted via the HEAD anchor by
+        construction, must still report the plan as active when the flag is
+        rejected and _lib_gate_diff_base falls back to a plain HEAD diff."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        (repo / ".claude" / "plans").mkdir(parents=True)
+        build_conflicted_revert(repo, file_name=".claude/plans/plan.md")
+
+        bin_dir = tmp_path / "bin-fallback-merge-base"
+        _make_git_rejecting_merge_base_flag(bin_dir)
+        active = _active_plan_files(
+            repo, env_overrides={"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        )
+        assert active.returncode == 0, active.stderr
+        assert ".claude/plans/plan.md" in active.stdout.splitlines()
+
+
+def _plan_review_empty_base_marker_value(base: str) -> str:
+    """Independent oracle for _lib_active_plan_hash's empty-base-relative-
+    active-set binding: sha256("plan-review-empty-base:<base>"), computed
+    directly in Python rather than by calling the shell function under
+    test."""
+    return hashlib.sha256(f"plan-review-empty-base:{base}".encode()).hexdigest()
+
+
+def _build_forged_anchor_invisible_plan_edit(tmp_path: Path, name: str = "repo") -> Path:
+    """The same forged-anchor + clean-merge technique
+    test_require_code_review.py's _build_forged_anchor_clean_merge
+    demonstrates against require-code-review.sh, applied to a plan file: M's
+    tree already contains the plan file's post-edit content, so after a
+    clean merge the plan file's working-tree content exactly matches the
+    forged base and _lib_active_plan_files' "modified vs base" leg excludes
+    it -- even though the plan file's content differs from real HEAD and was
+    never reviewed by anyone. `src/unrelated.py` is the Write target used to
+    probe whether the gate is disarmed for a call unrelated to the plan
+    file itself."""
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    plans_dir = repo / ".claude" / "plans"
+    plans_dir.mkdir(parents=True)
+    (plans_dir / "plan.md").write_text("# plan\n\nv1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
+    head_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    (plans_dir / "plan.md").write_text("# plan\n\nforged-content-nobody-reviewed\n")
+    subprocess.run(["git", "add", ".claude/plans/plan.md"], cwd=repo, check=True)
+    tree_oid = subprocess.run(
+        ["git", "write-tree"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    m_oid = subprocess.run(
+        ["git", "commit-tree", tree_oid, "-p", head_oid, "-m", "forged"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    subprocess.run(["git", "reset", "--hard", "-q", "HEAD"], cwd=repo, check=True)
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", m_oid], cwd=repo, check=True)
+    result = subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "-q", "refs/remotes/origin/main"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / ".git" / "MERGE_HEAD").exists()
+    return repo
+
+
+def _merge_head_tree_base(repo) -> str:
+    """Independently computes the same reference tree _lib_gate_diff_base's
+    merge row computes -- local copy of test_require_code_review.py's
+    _merge_tree_base (DAMP test code, per the neither-test-tree-imports-
+    the-other convention)."""
+    merge_head_oid = (repo / ".git" / "MERGE_HEAD").read_text().strip()
+    out = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "HEAD", merge_head_oid],
+        cwd=repo, capture_output=True, text=True, check=False,
+    ).stdout
+    return out.strip().splitlines()[0]
+
+
+class TestRequirePlanReviewForgedAnchorInvisiblePlanEdit:
+    """Adversarial coverage for _lib_active_plan_files' base substitution,
+    the sibling exposure ciso-reviewer flagged as likely-but-unconfirmed
+    against require-code-review.sh's forged-anchor finding: a plan file
+    edited to match a forged base's content disappears from the active set,
+    and this must not silently disarm the gate for an unrelated Write."""
+
+    def test_no_marker_denies_rather_than_silently_allowing(self, isolated_home, tmp_path):
+        repo = _build_forged_anchor_invisible_plan_edit(tmp_path)
+        assert (
+            run_hook(
+                REQUIRE_PLAN_REVIEW_HOOK,
+                {**write_input(str(repo / "src" / "unrelated.py")), "session_id": "s1"},
+                cwd=repo,
+            )
+            == "deny"
+        )
+
+    def test_marker_bound_to_this_forged_base_allows(self, plan_review_home, tmp_path):
+        """An honest /plan-review run against this exact (forged) base still
+        authorizes the write -- the fix denies by default, not
+        unconditionally."""
+        repo = _build_forged_anchor_invisible_plan_edit(tmp_path)
+        base = _merge_head_tree_base(repo)
+        marker = plan_review_marker_path(plan_review_home, repo, "s1")
+        marker.write_text(_plan_review_empty_base_marker_value(base))
+        assert (
+            run_hook(
+                REQUIRE_PLAN_REVIEW_HOOK,
+                {**write_input(str(repo / "src" / "unrelated.py")), "session_id": "s1"},
+                cwd=repo,
             )
             == "allow"
         )

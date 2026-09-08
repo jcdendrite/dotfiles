@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -13,16 +14,22 @@ from helpers import (
     DEFAULT_TEST_SESSION_ID,
     HOOKS_DIR,
     SKILLS_DIR,
+    bare_remote_with_default_branch,
     bash_input,
+    build_conflicted_rebase,
+    build_conflicted_revert,
     build_path_without,
     edit_input,
     extract_skill_command,
     git_toplevel,
     marker_path,
+    push_conflicting_edit_to_origin,
+    resolve_conflicted_rebase,
     run_hook,
     run_hook_reason,
     run_skill_command,
     staged_diff_hash,
+    staged_diff_hash_at_base,
     write_marker,
 )
 
@@ -738,5 +745,747 @@ class TestRequireCodeReviewComplianceLog:
             f"allow despite the compliance-log append being unable to "
             f"complete; got returncode={result.returncode}, "
             f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+
+
+def _build_conflicted_merge_via_origin(tmp_path: Path) -> Path:
+    """A conflicted merge whose MERGE_HEAD is trusted via the origin/<default>
+    anchor -- clone edits `f`, origin independently edits `f`, merge conflicts,
+    resolve and stage. Returns the clone with the conflict resolved and staged,
+    ready for `git commit`."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    (clone / "f").write_text("ours-edit\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "ours edits f"], cwd=clone, check=True)
+    push_conflicting_edit_to_origin(tmp_path, bare, "f", "origin-edit\n")
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    (clone / "f").write_text("resolved\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    return clone
+
+
+def _merge_tree_base(repo: Path) -> str:
+    """Independently computes the same reference tree
+    _lib_gate_diff_base's merge row computes, via the documented recipe
+    directly (not by calling the shell function under test). The literal
+    MERGE_HEAD *OID*, not the ref name, is passed as the argument -- git
+    embeds a merge-tree argument's own textual form into the conflict
+    marker label (`>>>>>>> MERGE_HEAD` vs `>>>>>>> <sha>`), so passing the
+    ref name here would silently compute a byte-different tree than
+    production's `merge-tree --write-tree HEAD "$state_oid"`, which reads
+    the OID straight from the gitdir file. Exit status is deliberately not
+    checked: `merge-tree --write-tree` exits 1 (not 0) whenever the merge it
+    computes conflicts -- the expected case here -- while still writing a
+    valid tree on its first stdout line."""
+    merge_head_oid = (repo / ".git" / "MERGE_HEAD").read_text().strip()
+    out = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "HEAD", merge_head_oid],
+        cwd=repo, capture_output=True, text=True, check=False,
+    ).stdout
+    return out.strip().splitlines()[0]
+
+
+def _cherry_pick_tree_base(repo: Path) -> str:
+    """Independently computes the same reference tree _lib_gate_diff_base's
+    cherry-pick row computes, via the documented recipe directly (not by
+    calling the shell function under test): merge-tree --write-tree
+    --merge-base=CHERRY_PICK_HEAD^ HEAD CHERRY_PICK_HEAD. Uses the literal
+    CHERRY_PICK_HEAD OID, not the ref name, for the same reason
+    _merge_tree_base documents for the merge row."""
+    cherry_pick_head_oid = (repo / ".git" / "CHERRY_PICK_HEAD").read_text().strip()
+    out = subprocess.run(
+        ["git", "merge-tree", "--write-tree",
+         f"--merge-base={cherry_pick_head_oid}^", "HEAD", cherry_pick_head_oid],
+        cwd=repo, capture_output=True, text=True, check=False,
+    ).stdout
+    return out.strip().splitlines()[0]
+
+
+def _empty_base_marker_value(base: str) -> str:
+    """Independent oracle for _lib_code_review_marker_value's empty-base-
+    relative-diff binding: sha256("code-review-empty-base:<base>"), computed
+    directly in Python rather than by calling the shell function under
+    test."""
+    return hashlib.sha256(f"code-review-empty-base:{base}".encode()).hexdigest()
+
+
+def _build_disjoint_files_clean_merge(tmp_path: Path) -> Path:
+    """A conflict-free merge via a real origin fetch (not forged) where the
+    clone and origin each add a different file, so the auto-merged result
+    has an empty base-relative diff even though the plain HEAD-relative diff
+    is non-empty (it includes origin's own new file). This is the
+    disqualified fixture shape for M-1 (two disjoint files, not one file
+    touched by both sides) -- valid only for exercising the empty-diff
+    branch itself, not the merge-tree-vs-path-intersection primitive
+    choice."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    (clone / "own.txt").write_text("own\n")
+    subprocess.run(["git", "add", "own.txt"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "own edits"], cwd=clone, check=True)
+    push_conflicting_edit_to_origin(tmp_path, bare, "other.txt", "origin-edit\n")
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "--no-commit", "-q", "origin/main"],
+        cwd=clone, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    return clone
+
+
+def _build_forged_anchor_clean_merge(
+    tmp_path: Path, name: str = "repo", payload_content: str = "payload\n"
+) -> Path:
+    """The forged-anchor + clean-merge attack: builds M via `git
+    commit-tree` (no `git commit` subprocess), forges
+    refs/remotes/origin/main to point at M directly (plain plumbing -- no
+    push, no fetch, no attacker infrastructure), then runs an ordinary `git
+    merge --no-ff --no-commit` against that forged ref. The merge
+    auto-stages M's payload file with no conflict, so the base-relative diff
+    is empty even though the payload is genuinely novel content nobody
+    reviewed. `name` distinguishes multiple independent repos built under
+    the same tmp_path; `payload_content` distinguishes their forged trees
+    (and therefore their resolved bases) from one another."""
+    repo = tmp_path / name
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "base.txt").write_text("base\n")
+    subprocess.run(["git", "add", "base.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    head_oid = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    (repo / "payload.txt").write_text(payload_content)
+    subprocess.run(["git", "add", "payload.txt"], cwd=repo, check=True)
+    tree_oid = subprocess.run(
+        ["git", "write-tree"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    m_oid = subprocess.run(
+        ["git", "commit-tree", tree_oid, "-p", head_oid, "-m", "forged"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    # Return the working tree to a clean HEAD state -- the merge below must
+    # introduce payload.txt itself, not find it already sitting untracked.
+    subprocess.run(["git", "reset", "--hard", "-q", "HEAD"], cwd=repo, check=True)
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", m_oid], cwd=repo, check=True)
+    result = subprocess.run(
+        ["git", "merge", "--no-ff", "--no-commit", "-q", "refs/remotes/origin/main"],
+        cwd=repo, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / ".git" / "MERGE_HEAD").exists()
+    return repo
+
+
+def _make_git_rejecting_write_tree(bin_dir: Path) -> Path:
+    """Simulates git < 2.38: `merge-tree --write-tree` is rejected outright.
+    Every other subcommand proxies to the real git (resolved via $REAL_GIT).
+    Local copy of test_lib.py's shim of the same name (DAMP test code, per
+    CLAUDE.md's named exception) -- this file's fallback assertion needs its
+    own stub, not a shared import, per the plan's "per call site" mandate."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "--write-tree" ]; then\n'
+        '    echo "error: unknown option \x60--write-tree\x60" >&2\n'
+        '    exit 129\n'
+        '  fi\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _make_git_rejecting_merge_base_flag(bin_dir: Path) -> Path:
+    """Simulates git 2.38-2.39: --write-tree is accepted but --merge-base=
+    is rejected. Local copy of test_lib.py's shim of the same name."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        '    --merge-base=*)\n'
+        '      echo "error: unknown option \x60--merge-base\x60" >&2\n'
+        '      exit 129\n'
+        '      ;;\n'
+        '  esac\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _make_blocking_merge_tree_git(bin_dir: Path) -> Path:
+    """For `merge-tree` specifically, writes a partial line to stdout then
+    blocks past the 5s cap; every other subcommand proxies to the real git.
+    Local copy of test_lib.py's shim of the same name."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "merge-tree" ]; then\n'
+        '    printf "partialline"\n'
+        '    sleep 20\n'
+        '    exit 0\n'
+        '  fi\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _timeout_binary_present() -> bool:
+    return shutil.which("timeout") is not None or shutil.which("gtimeout") is not None
+
+
+class TestRequireCodeReviewMergeAwareBase:
+    """require-code-review.sh threads _lib_gate_diff_base's resolved base
+    through both the empty-diff early exit and the marker hash, so a
+    mid-merge commit is reviewed on its novel content only."""
+
+    def test_mid_merge_marker_with_old_head_relative_preimage_denies(
+        self, isolated_home, tmp_path
+    ):
+        """Marker invalidation, leg 1 of 3: a marker holding the plain
+        HEAD-relative preimage (today's recipe) must not validate a mid-merge
+        commit -- it covers upstream's whole contribution, not just the
+        resolution, so treating it as authorization would be the security
+        regression this base substitution exists to close."""
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        write_marker(isolated_home, repo, staged_diff_hash(repo))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+            )
+            == "deny"
+        )
+
+    def test_mid_merge_marker_with_new_base_relative_preimage_allows(
+        self, isolated_home, tmp_path
+    ):
+        """Marker invalidation, leg 2 of 3: a marker holding the base-relative
+        preimage -- computed by the independent staged_diff_hash_at_base()
+        oracle, not by seeding from the production function under test --
+        must validate."""
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        base = _merge_tree_base(repo)
+        write_marker(isolated_home, repo, staged_diff_hash_at_base(repo, base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+            )
+            == "allow"
+        )
+
+    def test_outside_merge_state_old_head_relative_preimage_still_allows(
+        self, isolated_home, git_repo
+    ):
+        """Marker invalidation, leg 3 of 3: outside any in-progress state the
+        preimage is unchanged, so an ordinary marker keeps validating -- the
+        base substitution must not be a permanent break for the common case."""
+        write_marker(isolated_home, git_repo, staged_diff_hash(git_repo))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=git_repo,
+            )
+            == "allow"
+        )
+
+    def test_mid_merge_empty_novel_diff_denies_without_a_marker(self, isolated_home, tmp_path):
+        """A merge whose only novel content is what git's own auto-merge
+        already produced (no manual edits beyond `--no-commit`) has an empty
+        base-relative diff, even though the plain HEAD-relative diff is
+        non-empty (it includes origin's own new file). This must not be an
+        unconditional allow: with no marker present, the commit is denied,
+        the same posture any other unreviewed diff gets. A silent allow here
+        (sha256("") treated as authorization) is exactly the shape a forged
+        origin/<default> anchor plus a clean merge could otherwise exploit --
+        see TestRequireCodeReviewForgedAnchorEmptyBaseDiff below."""
+        clone = _build_disjoint_files_clean_merge(tmp_path)
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=clone,
+            )
+            == "deny"
+        )
+
+    def test_mid_merge_empty_novel_diff_marker_bound_to_base_allows(
+        self, isolated_home, tmp_path
+    ):
+        """The same fixture as above, with a marker holding the base-bound
+        value _lib_code_review_marker_value computes for an empty
+        base-relative diff -- allows. Proves an honest /code-review run
+        against this exact, genuinely-empty-relative-diff state still
+        authorizes the commit in one pass, so the fix does not make the
+        ordinary, non-adversarial case harder to pass."""
+        clone = _build_disjoint_files_clean_merge(tmp_path)
+        base = _merge_tree_base(clone)
+        write_marker(isolated_home, clone, _empty_base_marker_value(base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=clone,
+            )
+            == "allow"
+        )
+
+    def test_single_file_non_overlapping_hunks_auto_merge_contributes_nothing(
+        self, isolated_home, tmp_path
+    ):
+        """The primitive-choice case (M-1): one file touched by both sides in
+        non-overlapping hunks, auto-merging cleanly with no conflict. The
+        fixture must be a single shared file -- two files each touched by one
+        side (the case above) would pass under a path-intersection heuristic
+        too and would prove nothing about the merge-tree-vs-path-intersection
+        choice. A marker holding the base-bound empty-diff value allows;
+        without it, the commit denies -- either way, the base-relative diff
+        (not the whole file) is what the gate reasons about."""
+        bare, clone = bare_remote_with_default_branch(
+            tmp_path, file_name="shared.txt", file_content="line1\nline2\nline3\n"
+        )
+        (clone / "shared.txt").write_text("line1\nline2\nline3\nours-addition\n")
+        subprocess.run(["git", "add", "shared.txt"], cwd=clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "ours edits tail"], cwd=clone, check=True)
+        push_conflicting_edit_to_origin(
+            tmp_path, bare, "shared.txt", "origin-addition\nline1\nline2\nline3\n"
+        )
+        subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+        result = subprocess.run(
+            ["git", "merge", "--no-commit", "-q", "origin/main"],
+            cwd=clone, capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (clone / ".git" / "MERGE_HEAD").exists()
+        base = _merge_tree_base(clone)
+        assert staged_diff_hash_at_base(clone, base) == hashlib.sha256(b"").hexdigest(), (
+            "fixture must auto-merge to exactly the base-relative empty-diff shape"
+        )
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=clone,
+            )
+            == "deny"
+        )
+        write_marker(isolated_home, clone, _empty_base_marker_value(base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=clone,
+            )
+            == "allow"
+        )
+
+    def test_conflicted_cherry_pick_new_base_relative_preimage_allows(
+        self, isolated_home, tmp_path
+    ):
+        """Cherry-pick coverage: CHERRY_PICK_HEAD's merge-tree call uses
+        `--merge-base=CHERRY_PICK_HEAD^` (the parent, not the ref itself) --
+        a wiring bug specific to this call site's consumption of that arm
+        would ship undetected without a fixture reaching it, since the
+        primitive-level tests for _lib_gate_diff_base exercise it directly
+        rather than through this hook. The cherry-picked commit must be
+        trusted via the origin/<default> anchor: an ordinary
+        build_conflicted_cherry_pick() fixture (two sibling commits, neither
+        an ancestor of the other) reaches neither anchor, which would
+        exercise the empty-base fallback instead of this arm."""
+        bare, clone = bare_remote_with_default_branch(tmp_path)
+        (clone / "f").write_text("ours-edit\n")
+        subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "ours edits f"], cwd=clone, check=True)
+        push_conflicting_edit_to_origin(tmp_path, bare, "f", "origin-edit\n")
+        subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+        result = subprocess.run(
+            ["git", "cherry-pick", "origin/main"], cwd=clone, capture_output=True, text=True
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert (clone / ".git" / "CHERRY_PICK_HEAD").exists()
+        (clone / "f").write_text("resolved\n")
+        subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+        base = _cherry_pick_tree_base(clone)
+        write_marker(isolated_home, clone, staged_diff_hash_at_base(clone, base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=clone,
+            )
+            == "allow"
+        )
+
+    @pytest.mark.timing
+    @pytest.mark.skipif(
+        not _timeout_binary_present(), reason="no timeout/gtimeout on PATH to fire the cap"
+    )
+    def test_status_2_deny_message_names_undetermined_base(self, isolated_home, tmp_path):
+        """Status 2 never flips the allow/deny decision -- it only changes
+        what the deny message says, so a timeout-driven full-diff fallback
+        is distinguishable from an ordinary marker mismatch."""
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        bin_dir = tmp_path / "bin-blocking-merge-tree"
+        _make_blocking_merge_tree_git(bin_dir)
+        extra_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "REAL_GIT": shutil.which("git"),
+        }
+        reason = run_hook_reason(
+            CODE_REVIEW_HOOK,
+            bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+            cwd=repo,
+            extra_env=extra_env,
+        )
+        assert reason is not None, "expected a deny with no matching marker"
+        assert "novel-content base could not be computed" in reason
+        assert "fell back to the full HEAD-relative diff" in reason
+
+    def test_fallback_write_tree_rejected_behaves_like_today(self, isolated_home, tmp_path):
+        """`--write-tree` outright rejection (git < 2.38) affects every state
+        uniformly, so the merge fixture already used above exercises it: a
+        git that can't compute the novel-content base must fall back to
+        exactly today's plain HEAD-relative recipe, so a marker written
+        under the old recipe still validates."""
+        repo = _build_conflicted_merge_via_origin(tmp_path)
+        write_marker(isolated_home, repo, staged_diff_hash(repo))
+        bin_dir = tmp_path / "bin-fallback-write-tree"
+        _make_git_rejecting_write_tree(bin_dir)
+        extra_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "REAL_GIT": shutil.which("git"),
+        }
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+                extra_env=extra_env,
+            )
+            == "allow"
+        )
+
+    def test_fallback_merge_base_flag_rejected_behaves_like_today(self, isolated_home, tmp_path):
+        """The `--merge-base=` rejection band (git 2.38-2.39) only affects
+        the three states whose merge-tree call passes that flag -- rebase,
+        cherry-pick, revert, not merge -- so this needs its own fixture: a
+        conflicted revert, trusted via the HEAD anchor by construction."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        build_conflicted_revert(repo)
+        write_marker(isolated_home, repo, staged_diff_hash(repo))
+        bin_dir = tmp_path / "bin-fallback-merge-base"
+        _make_git_rejecting_merge_base_flag(bin_dir)
+        extra_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "REAL_GIT": shutil.which("git"),
+        }
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+                extra_env=extra_env,
+            )
+            == "allow"
+        )
+
+    def test_mid_rebase_ordinary_case_hash_matches_plain_head_relative_recipe(
+        self, isolated_home, tmp_path
+    ):
+        """Pinned through require-code-review.sh's own wiring, not only
+        through _lib_gate_diff_base: on an ordinary (non-anchor-reaching)
+        mid-rebase fixture, a bare `git commit` produces a hash matching
+        staged_diff_hash() -- the plain HEAD-relative recipe, since
+        REBASE_HEAD reaches neither anchor in the ordinary case -- not
+        staged_diff_hash_at_base() with any non-empty base."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        build_conflicted_rebase(repo)
+        resolve_conflicted_rebase(repo)
+        write_marker(isolated_home, repo, staged_diff_hash(repo))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+            )
+            == "allow"
+        )
+
+
+class TestRequireCodeReviewForgedAnchorEmptyBaseDiff:
+    """Adversarial coverage for the empty-diff branch when GATE_DIFF_BASE is
+    non-empty: a fabricated `commit-tree` commit and a hand-forged
+    refs/remotes/origin/main ref (no real push, no real fetch), merged
+    cleanly. Empirically confirmed to silently allow with no marker, no
+    deny, and no compliance-log line before this fix -- see
+    _build_forged_anchor_clean_merge's docstring for the exact attack
+    shape."""
+
+    def test_no_marker_denies_rather_than_silently_allowing(self, isolated_home, tmp_path):
+        repo = _build_forged_anchor_clean_merge(tmp_path)
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m done", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+            )
+            == "deny"
+        )
+
+    def test_marker_for_a_different_forged_base_does_not_authorize_this_one(
+        self, isolated_home, tmp_path
+    ):
+        """The sha256("") reuse concern: a marker obtained for one forged
+        base's degenerate empty-diff case must not validate a different,
+        independently-forged base landing on the same empty result. Writes
+        the base-bound marker value for a SECOND, differently-forged repo
+        and confirms it does not authorize the first repo's commit."""
+        repo = _build_forged_anchor_clean_merge(tmp_path, name="repo1", payload_content="payload-1\n")
+        other_repo = _build_forged_anchor_clean_merge(
+            tmp_path, name="repo2", payload_content="payload-2\n"
+        )
+        base = _merge_tree_base(repo)
+        other_base = _merge_tree_base(other_repo)
+        assert base != other_base, "fixture must produce two distinct forged bases"
+        write_marker(isolated_home, repo, _empty_base_marker_value(other_base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m done", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+            )
+            == "deny"
+        )
+
+    def test_marker_bound_to_this_forged_base_allows(self, isolated_home, tmp_path):
+        """An honest /code-review run against this exact (forged) base still
+        authorizes the commit -- the fix denies by default, not
+        unconditionally; a marker matching the actual resolved base still
+        validates, matching the ordinary marker-comparison contract."""
+        repo = _build_forged_anchor_clean_merge(tmp_path)
+        base = _merge_tree_base(repo)
+        write_marker(isolated_home, repo, _empty_base_marker_value(base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m done", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+            )
+            == "allow"
+        )
+
+    def test_compliance_log_names_the_empty_base_relative_diff_branch(
+        self, isolated_home, tmp_path
+    ):
+        """The compliance-log backstop must record that an empty
+        relative-to-base diff occurred during a detected in-progress state,
+        so a human auditor can distinguish this branch from an ordinary
+        large-diff mismatch."""
+        repo = _build_forged_anchor_clean_merge(tmp_path)
+        run_hook(
+            CODE_REVIEW_HOOK,
+            bash_input("git commit -m done", session_id=DEFAULT_TEST_SESSION_ID),
+            cwd=repo,
+        )
+        compliance_log = isolated_home / ".claude" / ".review-ledger-compliance.log"
+        assert compliance_log.exists(), "expected a compliance-log line to be appended"
+        lines = compliance_log.read_text().splitlines()
+        assert lines, "expected at least one compliance-log line"
+        assert "marker=unmatched-empty-base-relative-diff" in lines[-1]
+
+
+def _build_delete_modify_conflict_via_origin(tmp_path: Path) -> Path:
+    """A delete/modify conflict: the clone deletes `f`, origin independently
+    edits it, and merging surfaces the delete/modify conflict shape --
+    distinct from a two-sided content conflict, since one side has no blob
+    at all to three-way-merge against."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    subprocess.run(["git", "rm", "-q", "f"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "clone deletes f"], cwd=clone, check=True)
+    push_conflicting_edit_to_origin(tmp_path, bare, "f", "origin-edit\n")
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    (clone / "f").write_text("resolved\n")
+    subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+    return clone
+
+
+def _build_clean_merge_mode_bit_only_change(tmp_path: Path) -> Path:
+    """A conflict-free merge where upstream's only contribution to a shared
+    file is a mode-bit flip (chmod +x, no content change): the clone's own
+    commit touches an unrelated file so the merge cannot fast-forward and
+    leaves MERGE_HEAD, but `f` itself was never independently edited on the
+    clone's side."""
+    bare, clone = bare_remote_with_default_branch(tmp_path)
+    (clone / "own.txt").write_text("own\n")
+    subprocess.run(["git", "add", "own.txt"], cwd=clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "own edit"], cwd=clone, check=True)
+
+    push_clone = tmp_path / "push_clone"
+    subprocess.run(["git", "clone", "-q", str(bare), str(push_clone)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=push_clone, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=push_clone, check=True)
+    os.chmod(push_clone / "f", 0o755)
+    subprocess.run(["git", "add", "f"], cwd=push_clone, check=True)
+    subprocess.run(["git", "commit", "-qm", "origin marks f executable"], cwd=push_clone, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "main"], cwd=push_clone, check=True)
+
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+    result = subprocess.run(
+        ["git", "merge", "--no-commit", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (clone / ".git" / "MERGE_HEAD").exists()
+    return clone
+
+
+def _resolve_gitdir(repo: Path) -> Path:
+    """Resolve `repo`'s actual gitdir via `rev-parse --absolute-git-dir` --
+    for a linked worktree this is `<main-repo>/.git/worktrees/<name>`, not a
+    `.git` directory under `repo` itself, since a linked worktree's `.git`
+    is a gitdir-pointer file."""
+    return Path(
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--absolute-git-dir"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    )
+
+
+def _merge_tree_base_for_gitdir(repo: Path, gitdir: Path) -> str:
+    """Like _merge_tree_base above, but reads MERGE_HEAD from an explicit
+    gitdir rather than assuming `repo/.git` is a real directory -- needed
+    for a linked worktree."""
+    merge_head_oid = (gitdir / "MERGE_HEAD").read_text().strip()
+    out = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "HEAD", merge_head_oid],
+        cwd=repo, capture_output=True, text=True, check=False,
+    ).stdout
+    return out.strip().splitlines()[0]
+
+
+class TestRequireCodeReviewDiffBaseFixtureShapes:
+    """Coverage for _lib_gate_diff_base's base-relative diff computation
+    across conflict/state shapes not otherwise exercised in this file:
+    delete/modify conflicts, mode-bit-only changes, and a linked worktree as
+    the repo root the gate operates on."""
+
+    def test_delete_modify_conflict_new_base_relative_preimage_allows(
+        self, isolated_home, tmp_path
+    ):
+        """A delete/modify conflict (one side removes `f`, the other edits
+        it) still produces a valid merge-tree base -- the marker computed
+        against that base validates the resolved commit."""
+        repo = _build_delete_modify_conflict_via_origin(tmp_path)
+        base = _merge_tree_base(repo)
+        write_marker(isolated_home, repo, staged_diff_hash_at_base(repo, base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=repo,
+            )
+            == "allow"
+        )
+
+    def test_mode_bit_only_upstream_change_contributes_nothing_to_base_relative_diff(
+        self, isolated_home, tmp_path
+    ):
+        """Upstream's only contribution to a shared file is a mode-bit flip
+        (chmod +x, no content change) -- the merge auto-resolves it with no
+        conflict, and since the clone's own side never touched `f`, the
+        base-relative diff for it is empty: the trusted mode change is
+        already reflected in the resolved base, not novel content to
+        review."""
+        clone = _build_clean_merge_mode_bit_only_change(tmp_path)
+        base = _merge_tree_base(clone)
+        assert staged_diff_hash_at_base(clone, base) == hashlib.sha256(b"").hexdigest(), (
+            "fixture must auto-merge to exactly the base-relative empty-diff shape"
+        )
+        write_marker(isolated_home, clone, _empty_base_marker_value(base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=clone,
+            )
+            == "allow"
+        )
+
+    def test_linked_worktree_repo_root_computes_base_relative_diff(
+        self, isolated_home, tmp_path
+    ):
+        """A linked git worktree (not the main working tree) as the repo
+        root the gate operates on: _lib_gate_diff_base's
+        `rev-parse --absolute-git-dir` call resolves the worktree-specific
+        gitdir correctly, and the base-relative marker still validates a
+        mid-merge commit performed there."""
+        bare, clone = bare_remote_with_default_branch(tmp_path)
+        subprocess.run(["git", "branch", "-q", "wt-branch"], cwd=clone, check=True)
+        worktree = tmp_path / "linked-worktree"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", str(worktree), "wt-branch"], cwd=clone, check=True
+        )
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=worktree, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=worktree, check=True)
+        (worktree / "f").write_text("ours-edit\n")
+        subprocess.run(["git", "add", "f"], cwd=worktree, check=True)
+        subprocess.run(["git", "commit", "-qm", "ours edits f"], cwd=worktree, check=True)
+        push_conflicting_edit_to_origin(tmp_path, bare, "f", "origin-edit\n")
+        subprocess.run(["git", "fetch", "-q", "origin"], cwd=worktree, check=True)
+        result = subprocess.run(
+            ["git", "merge", "-q", "origin/main"], cwd=worktree, capture_output=True, text=True
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        gitdir = _resolve_gitdir(worktree)
+        assert (gitdir / "MERGE_HEAD").exists()
+        (worktree / "f").write_text("resolved\n")
+        subprocess.run(["git", "add", "f"], cwd=worktree, check=True)
+
+        base = _merge_tree_base_for_gitdir(worktree, gitdir)
+        write_marker(isolated_home, worktree, staged_diff_hash_at_base(worktree, base))
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=worktree,
+            )
+            == "allow"
         )
 

@@ -81,19 +81,43 @@ fi
 # satisfy the gate with a review of a tree nobody reviewed.
 [ -z "$CWD" ] && CWD="$PWD"
 
-REPO_ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)
+REPO_ROOT=$(_lib_capped git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)
 if [ -z "$REPO_ROOT" ]; then
   # Not in a git repo — let git surface the error itself
   exit 0
 fi
 
-# Empty staged diff: amend-message-only, --allow-empty, or nothing to commit.
-# No new content to review; let git decide whether the commit is valid.
-# deny-invisible-commit-content.sh makes an empty diff here mean an empty
-# commit for the shapes it closes — see its header's "Known gaps" list for
-# the residual. Do not remove either half independently.
-if [ -z "$(git -C "$REPO_ROOT" diff --cached 2>/dev/null)" ]; then
-  exit 0
+# Resolved once for this hook invocation and threaded through both the
+# empty-diff check below and the marker hash further down -- a second
+# resolution here would double the merge-tree cost per commit for the exact
+# same result. Empty BASE means no in-progress state was trusted (status 1)
+# or the base could not be computed (status 2); either way the empty-diff
+# check below issues plain `git diff --cached`, byte-identical to today's
+# command.
+GATE_DIFF_BASE=$(_lib_gate_diff_base "$REPO_ROOT")
+GATE_DIFF_BASE_STATUS=$?
+
+# Empty literal `git diff --cached`, with no trusted in-progress state to
+# substitute a base for: this commit authors nothing at all --
+# amend-message-only, --allow-empty, or nothing staged. Unaffected by the
+# base substitution below -- there is no trusted-but-forgeable anchor in
+# play here, so this stays a plain, unconditional early exit, byte-identical
+# to the pre-substitution recipe.
+# deny-invisible-commit-content.sh is what makes an empty diff here mean this
+# commit authors an empty commit, not that no commit will happen — do not
+# remove either half independently.
+#
+# A non-empty GATE_DIFF_BASE never takes this early exit, even on an empty
+# base-relative diff, since that emptiness could be a forged anchor rather
+# than an honest resolution. The marker comparison below still catches a
+# forged base: its value binds to GATE_DIFF_BASE's identity instead of
+# collapsing to sha256(""), so a marker from one base's empty-diff case
+# can't validate a different base.
+if [ -z "$GATE_DIFF_BASE" ]; then
+  EMPTY_DIFF_CHECK=$(git -C "$REPO_ROOT" diff --cached 2>/dev/null)
+  if [ -z "$EMPTY_DIFF_CHECK" ]; then
+    exit 0
+  fi
 fi
 
 # Honor in-chain marker writes. When the same Bash call chains
@@ -107,7 +131,16 @@ if _lib_chains_marker_write_before_commit "$COMMAND" code-review; then
 fi
 
 REPO_HASH=$(_marker_lib_repo_hash "$REPO_ROOT")
-CURRENT_HASH=$(git -C "$REPO_ROOT" diff --cached | sha256sum | awk '{print $1}')
+CURRENT_HASH=$(_lib_code_review_marker_value "$REPO_ROOT" "$GATE_DIFF_BASE")
+
+# Recomputed here, not threaded from `_lib_code_review_marker_value`, so the
+# compliance log can flag this security-relevant empty-base-relative-diff
+# branch separately from an ordinary mismatch.
+EMPTY_BASE_RELATIVE_DIFF_SUFFIX=""
+if [ -n "$GATE_DIFF_BASE" ] \
+  && [ "$CURRENT_HASH" = "$(_lib_hash_diff_text "$(_lib_code_review_empty_base_sentinel "$GATE_DIFF_BASE")")" ]; then
+  EMPTY_BASE_RELATIVE_DIFF_SUFFIX="-empty-base-relative-diff"
+fi
 
 # Fail closed: an unresolvable config dir must deny the gate, not silently
 # skip the marker check and let the commit through.
@@ -148,14 +181,22 @@ _log_compliance_line() {
 # reviewed?", not "did this session review it?". An empty CURRENT_HASH
 # (sha256sum unavailable) never matches, so a hashing failure denies.
 if _lib_marker_value_present "$CONFIG_DIR/code-review-markers" "$CURRENT_HASH" "$REPO_HASH."; then
-  _log_compliance_line matched
+  _log_compliance_line "matched${EMPTY_BASE_RELATIVE_DIFF_SUFFIX}"
   exit 0
 fi
 
-_log_compliance_line unmatched
+_log_compliance_line "unmatched${EMPTY_BASE_RELATIVE_DIFF_SUFFIX}"
 
 # No marker, or marker hash does not match the current staged state.
-# Build the reason as a bash variable so the conditional marker-chain
-# note can be interpolated; jq -Rs handles JSON-encoding safely
-# regardless of what characters appear in the appended note.
-emit_deny "Commit — the currently staged changes have not been reviewed, or the staged state has changed since the last review. Run the /code-review skill now on the currently staged diff. When the review is clean (no blockers), the skill will record the review in ~/.claude/code-review-markers/ and this commit will be allowed through on retry. Do not ask the user for permission — run the skill, address any findings, and retry the commit."
+# Build the reason as a bash variable so the conditional undetermined-base
+# note can be interpolated; jq -Rs handles JSON-encoding safely regardless
+# of what characters appear in the appended note.
+DENY_REASON="Commit — the currently staged changes have not been reviewed, or the staged state has changed since the last review. Run the /code-review skill now on the currently staged diff. When the review is clean (no blockers), the skill will record the review in ~/.claude/code-review-markers/ and this commit will be allowed through on retry. Do not ask the user for permission — run the skill, address any findings, and retry the commit."
+# Status 2 never changes this allow/deny decision -- it only changes what
+# this message says, so a timeout-driven full-diff fallback reads as
+# distinguishable from an ordinary marker mismatch rather than this gate
+# silently not working.
+if [ "$GATE_DIFF_BASE_STATUS" -eq 2 ]; then
+  DENY_REASON="${DENY_REASON} Note: this repo appears to be mid-merge/rebase/cherry-pick/revert, but the novel-content base could not be computed (a git call timed out, was killed, or its binary was missing), so this gate fell back to the full HEAD-relative diff instead of excluding already-reviewed upstream content."
+fi
+emit_deny "$DENY_REASON"

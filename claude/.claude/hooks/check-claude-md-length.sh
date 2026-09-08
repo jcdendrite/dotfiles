@@ -26,10 +26,15 @@
 # git calls below uncapped, so a stalled git (locked index, network mount)
 # hangs this gate rather than degrading gracefully.
 #
-# The commit-detection, repo-root, growth-comparison, and deny-message logic
-# is shared with check-skill-length.sh via _lib_staged_length_gate in
-# _lib.sh — this file supplies only the staged-path pattern, limit_for, and
-# (unlike check-skill-length.sh) the byte-limit constant below.
+# The growth-comparison and deny-message logic is shared with
+# check-skill-length.sh via _lib_staged_length_gate in _lib.sh — this file
+# supplies the staged-path pattern, limit_for, and (unlike
+# check-skill-length.sh) the byte-limit constant below. The commit-shape
+# check and REPO_ROOT resolution above are duplicated per file (not inside
+# _lib_staged_length_gate), matching require-code-review.sh's own ordering:
+# the commit-shape check must run before any git subprocess spawns, and
+# _lib_staged_length_gate needs REPO_ROOT already resolved as its own first
+# argument.
 
 set -uo pipefail
 
@@ -72,6 +77,35 @@ if [ "$TOOL_NAME" != "Bash" ]; then
   exit 0
 fi
 
+# Only gate git commit commands -- checked here, before REPO_ROOT resolution
+# below, so the overwhelming majority of Bash calls this hook is dispatched
+# for (per the "if" field's documented unreliability above) never spawn a
+# git subprocess at all. Matches require-code-review.sh's actual ordering,
+# not just its REPO_ROOT-resolution shape. Checked and fail-closed: an
+# undetermined match (sed/tr missing, killed, or erroring inside the helper)
+# must not silently let an unscanned commit bypass the length check.
+_lib_command_invokes_git_subcmd "$COMMAND" commit
+GIT_COMMIT_MATCH_STATUS=$?
+if [ "$GIT_COMMIT_MATCH_STATUS" -eq 1 ]; then
+  exit 0
+fi
+if [ "$GIT_COMMIT_MATCH_STATUS" -ne 0 ]; then
+  emit_deny "could not determine whether this command invokes git commit (status ${GIT_COMMIT_MATCH_STATUS}) — sed/tr may be missing, killed, or errored. Failing closed rather than letting an unscanned git commit bypass the length check."
+  exit 0
+fi
+
+# Resolve the repo from the payload's cwd rather than this hook process's
+# ambient cwd, matching require-code-review.sh's shape -- an ambient-cwd
+# resolution would let a session whose shell drifted to a different working
+# tree of the same repo compare against the wrong tree.
+[ -z "$CWD" ] && CWD="$PWD"
+
+REPO_ROOT=$(_lib_capped git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then
+  # Not in a git repo — let git surface the error itself
+  exit 0
+fi
+
 # Per-file limit override. Listed paths are repo-root-relative.
 limit_for() {
   case "$1" in
@@ -84,4 +118,4 @@ limit_for() {
 # directory, or at any depth inside a .claude/ directory. Does NOT match
 # files in arbitrary subdirectories (e.g. foo/CLAUDE.md) — only root-level
 # and .claude/-scoped files.
-_lib_staged_length_gate '^(CLAUDE\.md|AGENTS\.md|(.*/)?\.claude/(CLAUDE|AGENTS)\.md)$' "one or more files grew past the 200-line or ${GLOBAL_CLAUDE_MD_BYTE_LIMIT}-byte limit." "$GLOBAL_CLAUDE_MD_BYTE_LIMIT"
+_lib_staged_length_gate "$REPO_ROOT" '^(CLAUDE\.md|AGENTS\.md|(.*/)?\.claude/(CLAUDE|AGENTS)\.md)$' "one or more files grew past the 200-line or ${GLOBAL_CLAUDE_MD_BYTE_LIMIT}-byte limit." "$GLOBAL_CLAUDE_MD_BYTE_LIMIT"

@@ -28,9 +28,14 @@
 # git calls below uncapped, so a stalled git (locked index, network mount)
 # hangs this gate rather than degrading gracefully.
 #
-# The commit-detection, repo-root, growth-comparison, and deny-message logic
-# is shared with check-claude-md-length.sh via _lib_staged_length_gate in
-# _lib.sh — this file supplies only the staged-path pattern and limit_for.
+# The growth-comparison and deny-message logic is shared with
+# check-claude-md-length.sh via _lib_staged_length_gate in _lib.sh — this
+# file supplies only the staged-path pattern and limit_for. The commit-shape
+# check and REPO_ROOT resolution above are duplicated per file (not inside
+# _lib_staged_length_gate), matching require-code-review.sh's own ordering:
+# the commit-shape check must run before any git subprocess spawns, and
+# _lib_staged_length_gate needs REPO_ROOT already resolved as its own first
+# argument.
 
 set -uo pipefail
 
@@ -63,6 +68,35 @@ if [ "$TOOL_NAME" != "Bash" ]; then
   exit 0
 fi
 
+# Only gate git commit commands -- checked here, before REPO_ROOT resolution
+# below, so the overwhelming majority of Bash calls this hook is dispatched
+# for (per the "if" field's documented unreliability above) never spawn a
+# git subprocess at all. Matches require-code-review.sh's actual ordering,
+# not just its REPO_ROOT-resolution shape. Checked and fail-closed: an
+# undetermined match (sed/tr missing, killed, or erroring inside the helper)
+# must not silently let an unscanned commit bypass the length check.
+_lib_command_invokes_git_subcmd "$COMMAND" commit
+GIT_COMMIT_MATCH_STATUS=$?
+if [ "$GIT_COMMIT_MATCH_STATUS" -eq 1 ]; then
+  exit 0
+fi
+if [ "$GIT_COMMIT_MATCH_STATUS" -ne 0 ]; then
+  emit_deny "could not determine whether this command invokes git commit (status ${GIT_COMMIT_MATCH_STATUS}) — sed/tr may be missing, killed, or errored. Failing closed rather than letting an unscanned git commit bypass the length check."
+  exit 0
+fi
+
+# Resolve the repo from the payload's cwd rather than this hook process's
+# ambient cwd, matching require-code-review.sh's shape -- an ambient-cwd
+# resolution would let a session whose shell drifted to a different working
+# tree of the same repo compare against the wrong tree.
+[ -z "$CWD" ] && CWD="$PWD"
+
+REPO_ROOT=$(_lib_capped git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$REPO_ROOT" ]; then
+  # Not in a git repo — let git surface the error itself
+  exit 0
+fi
+
 # Per-skill limit override. Listed paths are repo-root-relative.
 limit_for() {
   case "$1" in
@@ -82,5 +116,6 @@ limit_for() {
 # - the single hardcoded plan-review/ROUTING.md exception (see limit_for() above)
 #
 # A repo-root skill has no override path in limit_for() and resolves to the
-# 200-line default, same as plugins/*/skills/.
-_lib_staged_length_gate '(claude-skills/skills/|plugins/[^/]+/skills/).+/SKILL\.md|^skills/.+/SKILL\.md$|^claude-skills/skills/plan-review/ROUTING\.md$' "one or more SKILL.md files grew past their per-skill limit."
+# 200-line default, same as plugins/*/skills/. In other repos this pattern
+# matches nothing and the gate exits 0 silently.
+_lib_staged_length_gate "$REPO_ROOT" '(claude-skills/skills/|plugins/[^/]+/skills/).+/SKILL\.md|^skills/.+/SKILL\.md$|^claude-skills/skills/plan-review/ROUTING\.md$' "one or more SKILL.md files grew past their per-skill limit."

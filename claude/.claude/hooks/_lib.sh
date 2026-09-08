@@ -471,6 +471,12 @@ _lib_marker_value_present() {
 # unchecked call lets the gate open on a set neither side actually saw, with
 # nothing logged. Every git call here is therefore capped and status-checked,
 # so a partial enumeration fails closed instead.
+# The "modified vs HEAD" leg diffs against BASE (already resolved by the
+# caller, typically via _lib_gate_diff_base -- see that function's own
+# docstring) instead of the literal HEAD, so a plan file a trusted
+# in-progress state brought in untouched is excluded from the active set;
+# an empty BASE means no override, diffing against literal HEAD exactly as
+# before this substitution existed.
 # :(glob) confines the `*` to one path segment, preserving the maxdepth-1
 # scope.
 # --others without --exclude-standard keeps gitignored plans in the set,
@@ -482,9 +488,9 @@ _lib_marker_value_present() {
 # Newline-delimited (not -z): a plan filename containing a newline is
 # already unsupported, and -z would force the output through a command
 # substitution, which strips NUL bytes.
-# Usage: files=$(_lib_active_plan_files "$REPO_ROOT") || <fail closed>
+# Usage: files=$(_lib_active_plan_files "$REPO_ROOT" "$BASE") || <fail closed>
 _lib_active_plan_files() {
-  local repo_root="$1"
+  local repo_root="$1" base="$2"
   local plans_dir="$repo_root/.claude/plans"
   [ -d "$plans_dir" ] || return 0
 
@@ -497,7 +503,7 @@ _lib_active_plan_files() {
   }
   if _lib_capped git -C "$repo_root" rev-parse --verify -q HEAD >/dev/null 2>&1; then
     modified_plans=$(_lib_capped git -C "$repo_root" -c core.quotePath=false \
-      diff --name-only --diff-filter=d HEAD -- "${plan_pathspecs[@]}" 2>/dev/null) || {
+      diff --name-only --diff-filter=d "${base:-HEAD}" -- "${plan_pathspecs[@]}" 2>/dev/null) || {
       printf '%s' "$plans_dir"
       return 1
     }
@@ -527,11 +533,20 @@ _lib_active_plan_files() {
 # an absolute path would fold any difference between those two resolutions
 # into the digest.
 #
+# BASE is already resolved by the caller and threaded straight into
+# _lib_active_plan_files -- see that function's own docstring for why this
+# is a required parameter rather than a self-contained resolution.
+#
 # Three-outcome contract -- exit status disambiguates stdout, because
 # "nothing to gate" and "could not compute" must never collapse onto the
 # same caller-visible signal:
-#   - exit 0, non-empty stdout: that hash is the active plan set.
-#   - exit 0, empty stdout:     no plan is active; the gate is disarmed.
+#   - exit 0, non-empty stdout: the active plan set's hash -- the ordinary
+#     content hash, or (when BASE is non-empty and no plan file differs from
+#     it) a value bound to BASE's own identity instead of collapsing to
+#     empty stdout, closing the same forged-base risk documented at
+#     _lib_gate_diff_base's docstring and _lib_code_review_marker_value above.
+#   - exit 0, empty stdout: no plan is active AND no trusted in-progress
+#     state was detected (BASE empty) -- the gate is disarmed.
 #   - exit 1, stdout = the path of the plan file that could not be hashed
 #     (unreadable, vanished mid-enumeration, sha256sum failed), or of
 #     .claude/plans/ itself when _lib_active_plan_files' own enumeration
@@ -565,17 +580,28 @@ _lib_active_plan_files() {
 # (0-1 in normal use, per that function's untracked-or-modified filter), not
 # .claude/plans/'s total size, and returns early with zero forks when
 # nothing is active.
-# Usage: hash=$(_lib_active_plan_hash "$REPO_ROOT")
+# Usage: hash=$(_lib_active_plan_hash "$REPO_ROOT" "$BASE")
 _lib_active_plan_hash() {
-  local repo_root="$1"
+  local repo_root="$1" base="$2"
   local plans_dir="$repo_root/.claude/plans"
 
   local active_files
-  if ! active_files=$(_lib_active_plan_files "$repo_root"); then
+  if ! active_files=$(_lib_active_plan_files "$repo_root" "$base"); then
     printf '%s' "$active_files"
     return 1
   fi
-  [ -n "$active_files" ] || return 0
+  if [ -z "$active_files" ]; then
+    if [ -n "$base" ]; then
+      # A trusted in-progress state was detected but no plan file differs
+      # from BASE. Binding to BASE's own identity rather than returning
+      # empty stdout keeps a forged base's degenerate empty-active-set
+      # result from silently disarming the gate the way an honestly-empty
+      # result (no trusted state at all) safely does.
+      _lib_hash_diff_text "plan-review-empty-base:$base"
+      return $?
+    fi
+    return 0
+  fi
 
   local file file_hash combined=""
   while IFS= read -r file; do
@@ -739,9 +765,7 @@ _lib_staged_diff_state() {
 # _lib_git_inprogress_state REPO_ROOT [GITDIR]
 # Detects which git operation, if any, is paused mid-way in REPO_ROOT:
 # rebase, merge, cherry-pick, or revert. Precedence is checked in that
-# order -- a conflicted `rebase -i` can also leave a stale CHERRY_PICK_HEAD
-# from a `--rebase-merges` replay step, so rebase must win the tie, matching
-# git-state-safety/SKILL.md's own rule-of-thumb ordering.
+# order, matching git-state-safety/SKILL.md's own rule-of-thumb ordering.
 # GITDIR is optional: when the caller has already resolved
 # `--absolute-git-dir` for its own purposes (_lib_gate_diff_base does), pass
 # it here to skip this function's own resolution and avoid spawning git
@@ -812,38 +836,35 @@ _lib_git_inprogress_state() {
 #
 # During a trusted in-progress state (see the anchor check below), this
 # computes the tree git's own automatic merge/rebase/cherry-pick/revert
-# machinery would have produced, via `git merge-tree --write-tree` (per
-# state, the exact base and tree-ish pair the state-detection table in
-# git-state-safety/SKILL.md's callers should use):
-#   rebase       merge-tree --write-tree --merge-base=REBASE_HEAD^ HEAD REBASE_HEAD
-#   merge        merge-tree --write-tree HEAD MERGE_HEAD
-#   cherry-pick  merge-tree --write-tree --merge-base=CHERRY_PICK_HEAD^ HEAD CHERRY_PICK_HEAD
-#   revert       merge-tree --write-tree --merge-base=REVERT_HEAD HEAD REVERT_HEAD^
-# `git diff --cached "$base"` against that tree is then exactly what the
-# author staged on top of it: conflict resolutions plus any hand edits,
-# with nothing the other side of the operation brought in untouched.
+# machinery would have produced, via `git merge-tree --write-tree`. See
+# docs/design-decisions/merge-tree-base-recipe-for-gate-diff-base.md for the
+# per-state command table and the anchor-admissibility argument this
+# function implements.
 #
-# Trust check, required before any of the above runs: presence of
-# MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge is not proof of
-# anything -- any of those is a plain gitdir file an ungated `git
-# update-ref` or `printf` can fabricate, pointing at arbitrary content. The
-# state's own OID (REBASE_HEAD/MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD's
-# content, unmodified) must first reach one of two anchors via `git
+# Trust check, required before any of the above runs. Presence of
+# MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge proves nothing by
+# itself: each is a plain gitdir file an ungated `git update-ref` or
+# `printf` can fabricate to point at arbitrary content. The state's own OID
+# (REBASE_HEAD/MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD's content,
+# unmodified) must therefore first reach one of two anchors via `git
 # merge-base --is-ancestor`:
 #   - the resolved default remote-tracking branch (origin/<default>, via
-#     _lib_resolve_default_branch) -- content already reviewed upstream.
+#     _lib_default_branch_or_guess) -- content already reviewed upstream.
 #   - HEAD -- content already committed in this repo, which required
 #     passing this same gate at its own commit time.
-# Neither anchor is unforgeable; both are admitted because honestly
-# reaching either implies the content already passed review, and forging
-# either is no cheaper than building a commit with `commit-tree` and
-# merging it in cleanly -- a route that already reaches a commit with no
-# gate seeing it at all, forgery or not. Reaching neither anchor -- an
-# unrelated cherry-pick source, a garbage or dangling OID, an octopus
-# MERGE_HEAD (multi-line, never a valid single revision), or a
-# `--rebase-merges` replay of a merge commit where REBASE_HEAD^ would
-# silently resolve to the wrong parent -- all fall back to the empty base,
-# over-scoping rather than smuggling content past the hash.
+# Both anchors are admitted despite neither being unforgeable: honestly
+# reaching either implies the content already passed review. Forging either
+# is no cheaper than building a commit with `commit-tree` and merging it in
+# cleanly -- a route that already reaches a commit with no gate seeing it at
+# all, forgery or not (full argument:
+# docs/design-decisions/merge-tree-base-recipe-for-gate-diff-base.md).
+# Reaching neither anchor falls back to the empty base, over-scoping rather
+# than smuggling content past the hash, for any of:
+#   - an unrelated cherry-pick source.
+#   - a garbage or dangling OID.
+#   - an octopus MERGE_HEAD (multi-line, never a valid single revision).
+#   - a `--rebase-merges` replay of a merge commit, where REBASE_HEAD^ would
+#     silently resolve to the wrong parent.
 #
 # The trust-anchor check above is also the reason state_oid must be
 # shape-validated (a bare 40- or 64-hex-char string, git's two supported OID
@@ -918,7 +939,7 @@ _lib_gate_diff_base() {
   [[ "$state_oid" =~ ^[0-9a-f]{40}$ ]] || [[ "$state_oid" =~ ^[0-9a-f]{64}$ ]] || return 1
 
   local default_branch anchor_reached=1
-  default_branch=$(_lib_resolve_default_branch "$repo_root")
+  default_branch=$(_lib_default_branch_or_guess "$repo_root")
   if [ -n "$default_branch" ] \
     && _lib_capped git -C "$repo_root" merge-base --is-ancestor "$state_oid" "origin/$default_branch" >/dev/null 2>&1
   then
@@ -990,28 +1011,71 @@ _lib_gate_diff_base() {
 # on exit 1, the same posture _lib_active_plan_hash and
 # _lib_reviewer_round_state_value already document for this class of
 # failure.
+# Fails closed on an empty REPO_ROOT rather than letting `git -C ""` resolve
+# relative to the caller's cwd -- every current call site already validates
+# REPO_ROOT, but this is a shared primitive future callers may not.
 _lib_staged_diff_hash() {
   [ "$#" -ge 2 ] || return 1
   local repo_root="$1" base="$2"
+  [ -n "$repo_root" ] || return 1
   shift 2
+  local -a diff_args=(-C "$repo_root" diff --cached)
+  [ -n "$base" ] && diff_args+=("$base")
+  [ "$#" -gt 0 ] && diff_args+=(-- "$@")
   local out git_status digest
-  if [ -n "$base" ]; then
-    out=$(
-      _lib_capped git -C "$repo_root" diff --cached "$base" -- "$@" 2>/dev/null | sha256sum | awk '{print $1}'
-      printf '\n%s' "${PIPESTATUS[0]}"
-    )
-  else
-    out=$(
-      _lib_capped git -C "$repo_root" diff --cached -- "$@" 2>/dev/null | sha256sum | awk '{print $1}'
-      printf '\n%s' "${PIPESTATUS[0]}"
-    )
-  fi
+  out=$(
+    _lib_capped git "${diff_args[@]}" 2>/dev/null | sha256sum | awk '{print $1}'
+    printf '\n%s' "${PIPESTATUS[0]}"
+  )
   git_status="${out##*$'\n'}"
   digest="${out%$'\n'*}"
   digest="${digest%$'\n'}"
   [ "$git_status" -eq 0 ] || return 1
   [ -n "$digest" ] || return 1
   printf '%s' "$digest"
+}
+
+# _lib_code_review_empty_base_sentinel BASE
+# The literal string _lib_code_review_marker_value hashes when BASE is
+# non-empty and the base-relative staged diff is itself empty (see that
+# function's own docstring below). require-code-review.sh's and marker.sh's
+# read sites reconstruct the same value, so all three call this rather than
+# inlining the literal.
+_lib_code_review_empty_base_sentinel() {
+  printf 'code-review-empty-base:%s' "$1"
+}
+
+# _lib_code_review_marker_value REPO_ROOT BASE
+# The code-review completion-marker preimage. Ordinarily identical to
+# _lib_staged_diff_hash REPO_ROOT BASE's own output. When BASE is non-empty
+# (a trusted in-progress merge/rebase/cherry-pick/revert) and the
+# base-relative staged diff is itself empty, the value binds to BASE's own
+# identity instead of falling through to sha256(""). sha256("") is a fixed
+# value independent of which base produced it, so a marker obtained during
+# one trusted operation's degenerate empty-diff case would otherwise
+# validate a different, forged base landing on the same empty result.
+# Shared by marker.sh's `write code-review`/`status` arms and
+# require-code-review.sh's read side so a value computed separately at each
+# call site cannot drift out of agreement -- the same discipline
+# _lib_staged_diff_hash's own docstring describes for BASE threading
+# generally.
+# Two-outcome contract, matching _lib_staged_diff_hash: exit 0 with the hex
+# digest on stdout, exit 1 with empty stdout when the base-relative diff
+# itself could not be computed (git failure or cap kill).
+_lib_code_review_marker_value() {
+  [ "$#" -eq 2 ] || return 1
+  local repo_root="$1" base="$2"
+  if [ -n "$base" ]; then
+    local relative_diff diff_status
+    relative_diff=$(_lib_capped git -C "$repo_root" diff --cached "$base" 2>/dev/null)
+    diff_status=$?
+    [ "$diff_status" -eq 0 ] || return 1
+    if [ -z "$relative_diff" ]; then
+      _lib_hash_diff_text "$(_lib_code_review_empty_base_sentinel "$base")"
+      return $?
+    fi
+  fi
+  _lib_staged_diff_hash "$repo_root" "$base"
 }
 
 # _lib_is_repo_plan_file REPO_ROOT ABS_PATH
@@ -1563,7 +1627,7 @@ _lib_length_ratchet_exceeded() {
   [ "$new" -gt "$limit" ] && [ "$new" -gt "$old" ]
 }
 
-# _lib_staged_length_gate PATTERN OVER_LIMIT_MESSAGE [BYTE_LIMIT]
+# _lib_staged_length_gate REPO_ROOT PATTERN OVER_LIMIT_MESSAGE [BYTE_LIMIT]
 # Shared body behind check-skill-length.sh and check-claude-md-length.sh:
 # deny a git commit when a staged file matching PATTERN (a grep -E pattern
 # over `git diff --cached --name-only` output) is over its per-file limit
@@ -1573,12 +1637,16 @@ _lib_length_ratchet_exceeded() {
 # Runs only when a Bash command invokes `git commit`, gated behind both
 # callers' `if: git commit *` matcher in settings.json — commit-time-cold,
 # not per-tool-call like most _lib.sh helpers.
+# REPO_ROOT is resolved by the caller from the payload's cwd, the same shape
+# require-code-review.sh uses, and threaded through every git call below --
+# an ambient-cwd call here would let a session whose shell drifted to a
+# different working tree of the same repo compare against the wrong tree.
 #
 # BYTE_LIMIT is optional and opt-in. When set, the byte check derives
 # counts via `git cat-file -s` rather than reusing the `git show` reads
 # captured for the line-count check — bash command substitution silently
 # drops embedded NUL bytes, which would undercount `wc -c` over that
-# captured content. check-skill-length.sh's call site omits it (2-arg
+# captured content. check-skill-length.sh's call site omits it (3-arg
 # form, unchanged behavior). check-claude-md-length.sh passes it. Both
 # dimensions accumulate into the same $messages/$fail pair below,
 # producing one combined emit_deny call at the bottom rather than two.
@@ -1588,8 +1656,13 @@ _lib_length_ratchet_exceeded() {
 # does, per that function's own contract comment) and `limit_for` (a
 # function mapping a repo-root-relative staged path to its line-count
 # limit) before calling this. Also relies on the caller having already
-# populated $COMMAND and $TOOL_NAME via _lib_parse_tool_input_or_deny, and
-# on the caller having already exited for a non-Bash TOOL_NAME.
+# populated $COMMAND and $TOOL_NAME via _lib_parse_tool_input_or_deny, on
+# the caller having already exited for a non-Bash TOOL_NAME, and on the
+# caller having already confirmed this is a git-commit-shaped command
+# (_lib_command_invokes_git_subcmd "$COMMAND" commit, failing closed on an
+# undetermined match) before ever resolving REPO_ROOT or calling this --
+# the commit-shape check must run before any git subprocess spawns, so it
+# lives in the caller, ahead of REPO_ROOT resolution, not in here.
 #
 # OVER_LIMIT_MESSAGE now carries only the caller's own over-limit sentence:
 # the gate-identity prefix comes from _lib_emit_deny's DENY_GATE_LABEL, not
@@ -1619,17 +1692,23 @@ _lib_length_ratchet_exceeded() {
 # per revision, feeding the byte-count check) are covered by
 # test_byte_cap_cat_file_git_timeout_engages_cap in
 # test_check_claude_md_length.py.
+#
+# `old` (the previously committed version, for both the line-count and
+# byte-count checks) is measured against _lib_gate_diff_base's resolved
+# base, not the literal HEAD -- resolved once above the loop below, since a
+# per-file resolution inside it would spawn state detection and a full
+# merge-tree --write-tree once per staged file for a value identical on
+# every iteration. This is a delta comparison (new > limit && new > old),
+# not an absolute diff: mid-merge, the base substitution stops upstream's
+# own growth of a file from being charged to the merger, since `old` would
+# otherwise be the pre-merge feature tip. Mid-rebase, where the base stays
+# empty because REBASE_HEAD reaches neither anchor in the ordinary case,
+# `old` falls back to mid-rebase HEAD -- the new base plus already-replayed
+# commits -- which is already the correct pre-commit baseline for the
+# commit being replayed, so this consumer has no rebase-specific over-count
+# either way.
 _lib_staged_length_gate() {
-  local pattern="$1" over_limit_message="$2" byte_limit="${3:-}"
-  _lib_command_invokes_git_subcmd "$COMMAND" commit
-  local git_commit_match_status=$?
-  if [ "$git_commit_match_status" -eq 1 ]; then
-    return 0
-  fi
-  if [ "$git_commit_match_status" -ne 0 ]; then
-    emit_deny "could not determine whether this command invokes git commit (status ${git_commit_match_status}) — sed/tr may be missing, killed, or errored. Failing closed rather than letting an unscanned git commit bypass the length check."
-    return 0
-  fi
+  local repo_root="$1" pattern="$2" over_limit_message="$3" byte_limit="${4:-}"
 
   # Fail closed if a caller forgot to define limit_for, rather than letting
   # `limit=$(limit_for "$f")` silently yield empty and skip the length check.
@@ -1638,9 +1717,12 @@ _lib_staged_length_gate() {
     return 0
   fi
 
-  if [ "$(_lib_capped git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
+  if [ "$(_lib_capped git -C "$repo_root" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
     return 0
   fi
+
+  local base
+  base=$(_lib_gate_diff_base "$repo_root")
 
   local fail=0 messages="" f new old limit new_content old_content
   while IFS= read -r f; do
@@ -1651,9 +1733,9 @@ _lib_staged_length_gate() {
     # the separate `git cat-file -s` calls below, precisely to avoid this
     # same command substitution's NUL-byte-dropping behavior (see the
     # BYTE_LIMIT comment on _lib_staged_length_gate's header above).
-    new_content=$(_lib_capped git show ":$f" 2>/dev/null; printf x)
+    new_content=$(_lib_capped git -C "$repo_root" show ":$f" 2>/dev/null; printf x)
     new_content="${new_content%x}"
-    old_content=$(_lib_capped git show "HEAD:$f" 2>/dev/null; printf x)
+    old_content=$(_lib_capped git -C "$repo_root" show "${base:-HEAD}:$f" 2>/dev/null; printf x)
     old_content="${old_content%x}"
     new=$(printf '%s' "$new_content" | awk 'END{print NR}')
     old=$(printf '%s' "$old_content" | awk 'END{print NR}')
@@ -1664,8 +1746,8 @@ _lib_staged_length_gate() {
     fi
     if [ -n "$byte_limit" ]; then
       local new_bytes old_bytes
-      new_bytes=$(_lib_capped git cat-file -s ":$f" 2>/dev/null)
-      old_bytes=$(_lib_capped git cat-file -s "HEAD:$f" 2>/dev/null)
+      new_bytes=$(_lib_capped git -C "$repo_root" cat-file -s ":$f" 2>/dev/null)
+      old_bytes=$(_lib_capped git -C "$repo_root" cat-file -s "${base:-HEAD}:$f" 2>/dev/null)
       [ -n "$new_bytes" ] || new_bytes=0
       [ -n "$old_bytes" ] || old_bytes=0
       if _lib_length_ratchet_exceeded "$new_bytes" "$old_bytes" "$byte_limit"; then
@@ -1673,7 +1755,7 @@ _lib_staged_length_gate() {
         fail=1
       fi
     fi
-  done < <(_lib_capped git diff --cached --name-only 2>/dev/null | grep -E "$pattern")
+  done < <(_lib_capped git -C "$repo_root" diff --cached --name-only 2>/dev/null | grep -E "$pattern")
 
   if [ "$fail" -eq 1 ]; then
     local reason
@@ -3106,26 +3188,47 @@ _lib_reviewer_round_state_key() {
 # Prints "<head-sha> <staged-diff-sha256>" -- the one-line-per-round-state
 # unit each entry in <config-dir>/.reviewer-round-state.d/<key> holds. Returns
 # 1 with no stdout when REPO_ROOT is empty, HEAD is unresolvable (no commits
-# yet), or the staged diff is unanswerable (_lib_staged_diff_state reports
-# "unknown") -- callers must fail open, same posture as
+# yet), or the staged-diff git call itself failed or was capped-killed --
+# caught by _lib_staged_diff_hash's own PIPESTATUS check on that exact call,
+# not a separate probe -- callers must fail open, same posture as
 # _lib_reviewer_round_state_key above.
 # An empty staged diff is a legitimate round state here (unlike marker.sh's
-# write-arm callers), so it hashes through like content -- only "unknown" is
-# rejected.
-# Three sequential _lib_capped git calls back this function (rev-parse
-# --verify -q HEAD, then the _lib_staged_diff_state probe, then the diff
-# hash), so the worst-case ceiling compounds linearly -- roughly 5s per
-# call -- and a future fourth capped call here would push that ceiling
-# higher still.
+# write-arm callers), so it hashes through like content -- only a failed or
+# killed git call is rejected.
+#
+# The diff-hash half routes through _lib_gate_diff_base/_lib_staged_diff_hash,
+# so a mid-merge round-state value covers the same novel content the other
+# marker preimages do rather than the whole pre-merge diff. When BASE is
+# non-empty and the base-relative staged diff is itself empty, the diff-hash
+# half binds to BASE's own identity ("round-state-empty-base:$base") instead
+# of falling through to sha256(""), matching _lib_code_review_marker_value's
+# own reasoning: sha256("") is a fixed value independent of which base
+# produced it, so a round-state entry recorded during one trusted
+# operation's degenerate empty-diff case would otherwise validate a
+# different, forged base landing on the same empty result. This is the
+# diff-hash half only -- it does not reach _lib_reviewer_round_state_key's
+# separate branch-half gap, where a detached HEAD mid-rebase disarms the
+# round-3 consult gate for the operation's duration regardless of this value.
+#
+# Capped-git-call count varies by branch: 3 in the common case outside any
+# in-progress merge/rebase/cherry-pick/revert (HEAD rev-parse, the gitdir
+# rev-parse inside _lib_gate_diff_base, the diff itself), up to 8
+# mid-operation (adds the ref-file cat, up to two merge-base anchor checks,
+# the merge-tree computation, and the tree verification, all inside
+# _lib_gate_diff_base) -- a future added capped call here pushes the
+# mid-operation ceiling higher still.
 #
 # Determinism contract (read side and write side must agree byte-for-byte):
-# both halves are captured and tested for emptiness rather than trusted as a
-# pipeline exit status, so the contract holds regardless of the caller's
-# `set -u`/`pipefail` options (matching _lib_active_plan_hash).
+# both halves are captured into variables and tested for emptiness rather
+# than trusted as a pipeline's exit status, matching _lib_active_plan_hash's
+# own documented reason -- this keeps the contract independent of the
+# caller's shell options (a caller sourcing this under `set -u` with no
+# `pipefail` would otherwise see a failed `git diff` silently yield an
+# empty-but-"successful" sha256sum of nothing).
 _lib_reviewer_round_state_value() {
   local repo_root="$1"
   [ -n "$repo_root" ] || return 1
-  local head_sha diff_state diff_hash
+  local head_sha diff_hash base
   # `--verify` is load-bearing, not stylistic: bare `rev-parse HEAD` on an
   # unborn branch (no commits yet) echoes the literal string "HEAD" back to
   # STDOUT while exiting non-zero, so a caller checking only for a non-empty
@@ -3136,10 +3239,19 @@ _lib_reviewer_round_state_value() {
   # for the same reason, `git rev-parse --verify -q HEAD`).
   head_sha=$(_lib_capped git -C "$repo_root" rev-parse --verify -q HEAD 2>/dev/null)
   [ -n "$head_sha" ] || return 1
-  diff_state=$(_lib_staged_diff_state "$repo_root")
-  [ "$diff_state" != "unknown" ] || return 1
-  diff_hash=$(_lib_capped git -C "$repo_root" diff --cached 2>/dev/null | sha256sum | awk '{print $1}')
-  [ -n "$diff_hash" ] || return 1
+  base=$(_lib_gate_diff_base "$repo_root")
+  if [ -n "$base" ]; then
+    local relative_diff diff_status
+    relative_diff=$(_lib_capped git -C "$repo_root" diff --cached "$base" 2>/dev/null)
+    diff_status=$?
+    [ "$diff_status" -eq 0 ] || return 1
+    if [ -z "$relative_diff" ]; then
+      diff_hash=$(_lib_hash_diff_text "round-state-empty-base:$base") || return 1
+      printf '%s %s' "$head_sha" "$diff_hash"
+      return 0
+    fi
+  fi
+  diff_hash=$(_lib_staged_diff_hash "$repo_root" "$base") || return 1
   printf '%s %s' "$head_sha" "$diff_hash"
 }
 

@@ -1155,13 +1155,15 @@ def plan_review_marker_path(
 
 
 def write_plan_review_marker(
-    home: Path, repo: Path, session_id: str, config_dir: Path | None = None
+    home: Path, repo: Path, session_id: str, config_dir: Path | None = None, base: str = ""
 ) -> Path:
     """Write a plan-review completion marker whose content is the real
     active-plan hash for `repo`, computed by shelling out to the production
     `_lib_active_plan_hash` (_lib.sh) rather than reimplementing the recipe
     in Python, which would diverge silently on any
-    newline/delimiter/normalization detail.
+    newline/delimiter/normalization detail. `base` defaults to "" (no
+    trusted in-progress state) -- pass the merge-tree base explicitly for a
+    marker meant to validate mid-merge/rebase/cherry-pick/revert.
 
     Note the tradeoff, and do not mistake this for the technique
     `write_marker`/`write_skill_review_marker` use: those recompute the hash
@@ -1176,7 +1178,8 @@ def write_plan_review_marker(
     marker.parent.mkdir(parents=True, exist_ok=True)
     lib_sh = HOOKS_DIR / "_lib.sh"
     active_plan_hash = subprocess.run(
-        ["bash", "-c", f'. "{lib_sh}"; _lib_active_plan_hash "$1"', "write_plan_review_marker", str(repo)],
+        ["bash", "-c", f'. "{lib_sh}"; _lib_active_plan_hash "$1" "$2"',
+         "write_plan_review_marker", str(repo), base],
         capture_output=True,
         text=True,
         check=True,
