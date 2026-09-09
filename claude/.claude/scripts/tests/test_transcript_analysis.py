@@ -16427,12 +16427,12 @@ _DENIAL_HOOK_NAME_SHAPE_RE = re.compile(r"[\w .-]+")
 # Call shapes that carry a deny-message literal: emit_deny, its
 # emit_deny_folding_fresh_lock_context wrapper
 # (require-worktree-for-git-writes.sh), and _lib_parse_tool_input_or_deny's
-# own argument. _lib_staged_length_gate's second (message) argument is
-# reached via its distinct two-argument call shape, since its first argument
-# is a single-quoted grep -E pattern rather than a deny literal.
+# own argument. _lib_staged_length_gate's third (message) argument is
+# reached via its distinct three-argument call shape — "$REPO_ROOT", then a
+# single-quoted grep -E pattern, then the deny literal.
 _DENY_LITERAL_CALL_START_RE = re.compile(
     r"(?<![\w])(?:emit_deny|emit_deny_folding_fresh_lock_context|_lib_parse_tool_input_or_deny)\s+\""
-    r"|_lib_staged_length_gate\s+'[^']*'\s+\""
+    r"|_lib_staged_length_gate\s+\"\$REPO_ROOT\"\s+'[^']*'\s+\""
 )
 
 
