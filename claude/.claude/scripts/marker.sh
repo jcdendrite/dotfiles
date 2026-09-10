@@ -431,6 +431,12 @@ case "$SUBCOMMAND" in
         # read-side base recipes would mean a marker written here can never
         # match on the read side.
         GATE_DIFF_BASE=$(_lib_gate_diff_base "$REPO_ROOT")
+        # This call and require-code-review.sh's own _lib_gate_diff_base call
+        # each independently hit the ~5s cap, so during an in-progress
+        # merge/rebase/cherry-pick/revert a marker can fail to match on read
+        # despite unchanged staged content.
+        # This never causes a false accept, only a false re-review
+        # requirement, so it is an availability gap, not a security one.
         # Compute before redirecting: `>` truncates the marker before the
         # pipeline runs, so a failed hash would destroy a valid marker and
         # silently force a re-review. Same shape in every arm below.
@@ -516,6 +522,10 @@ case "$SUBCOMMAND" in
           # truncate an existing valid marker before the function even runs,
           # so a failed attempt would destroy a good marker as a side effect.
           PLAN_GATE_DIFF_BASE=$(_lib_gate_diff_base "$REPO_ROOT")
+          # Same residual as the `write code-review` arm above: this call and
+          # require-plan-review.sh's own _lib_gate_diff_base call can disagree
+          # near the ~5s cap even though the staged content hasn't changed.
+          # Fails toward re-review, not toward accepting an unreviewed plan.
           if ! PLAN_HASH=$(_lib_active_plan_hash "$REPO_ROOT" "$PLAN_GATE_DIFF_BASE"); then
             printf 'marker.sh: cannot read active plan file %s — cannot compute the plan-review hash. Abort without writing a marker.\n' "$PLAN_HASH" >&2
             exit 2
