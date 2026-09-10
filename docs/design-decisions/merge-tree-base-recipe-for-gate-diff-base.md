@@ -21,7 +21,7 @@ The exact base and tree-ish pair, matching the state-detection table in `git-sta
 
 Presence of `MERGE_HEAD`/`CHERRY_PICK_HEAD`/`REVERT_HEAD`/`rebase-merge` proves nothing by itself — each is a plain gitdir file an ungated `git update-ref` or `printf` can fabricate to point at arbitrary content. The state's own OID must first reach one of two anchors via `git merge-base --is-ancestor`: the resolved default remote-tracking branch (`origin/<default>`) or `HEAD`.
 
-Neither anchor is unforgeable. Both are admitted anyway because honestly reaching either implies the content already passed review, and forging either is no cheaper than building a commit with `commit-tree` and merging it in cleanly — a route that already reaches a commit with no gate seeing it at all, forgery or not. Admitting the anchor therefore costs nothing beyond a bypass this design already accepts elsewhere (the same ungated-local-plumbing residual named in `.claude/plans/merge-aware-review-gates.md`'s G-6).
+Neither anchor is unforgeable. Both are admitted anyway because honestly reaching either implies the content already passed review, and forging either is no cheaper than building a commit with `commit-tree` and merging it in cleanly — a route that already reaches a commit with no gate seeing it at all, forgery or not. Admitting the anchor therefore costs nothing beyond a bypass this design already accepts elsewhere: an agent with local git access can already fabricate a trusted-looking merge state without a gate seeing it (see `.claude/plans/merge-aware-review-gates.md` for the fuller residual-risk inventory).
 
 Reaching neither anchor falls back to the empty base — over-scoping the diff rather than smuggling content past the hash — for any of:
 

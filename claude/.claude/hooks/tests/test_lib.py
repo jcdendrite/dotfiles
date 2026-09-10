@@ -5025,7 +5025,7 @@ def _gate_diff_base(
 
 
 def _staged_diff_hash(
-    repo: Path, base: str, *pathspecs: str, env: dict | None = None
+    repo: Path, base: str, *pathspecs: str, env: dict | None = None, timeout: float | None = None
 ) -> subprocess.CompletedProcess:
     return subprocess.run(
         [
@@ -5037,6 +5037,7 @@ def _staged_diff_hash(
         text=True,
         check=False,
         env=env if env is not None else dict(os.environ),
+        timeout=timeout,
     )
 
 
@@ -5647,6 +5648,29 @@ def _make_blocking_merge_tree_git(bin_dir: Path) -> Path:
     return shim
 
 
+def _make_blocking_diff_git(bin_dir: Path) -> Path:
+    """Shim at bin_dir/git: for `diff` specifically, writes a partial line to
+    stdout then blocks past the 5s cap; every other subcommand proxies to the
+    real git. Same shape as _make_blocking_merge_tree_git above, targeting
+    _lib_staged_diff_hash's `git diff --cached` call instead of
+    _lib_gate_diff_base's `merge-tree` call."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "diff" ]; then\n'
+        '    printf "partialline"\n'
+        '    sleep 20\n'
+        '    exit 0\n'
+        '  fi\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
 def _make_call_logging_git(bin_dir: Path, log_file: Path) -> Path:
     """Shim at bin_dir/git: appends the full argument list to log_file, one
     invocation per line, then proxies to the real git."""
@@ -5924,5 +5948,28 @@ class TestStagedDiffHash:
         restricted_path = build_path_without("sha256sum", farm_dir)
         env = {"PATH": restricted_path, "HOME": str(tmp_path)}
         result = _staged_diff_hash(repo, "", env=env)
+        assert result.returncode == 1
+        assert result.stdout == ""
+
+    @pytest.mark.timing
+    @pytest.mark.skipif(
+        not _timeout_binary_present(), reason="no timeout/gtimeout on PATH to fire the cap"
+    )
+    def test_blocking_diff_returns_empty_stdout_not_partial_hash(
+        self, tmp_path: Path
+    ) -> None:
+        """Proves the same safety property TestGateDiffBaseCapFaultInjection
+        proves for `merge-tree` -- ${PIPESTATUS[0]} must catch a `git diff`
+        killed past the cap so a partial or interrupted diff never gets
+        hashed onto stdout. timeout=30 bounds a cap regression to a fast
+        failure instead of a 20s hang (the shim's own sleep)."""
+        repo = tmp_path / "repo"
+        _init_repo_on_branch(repo, "main")
+        (repo / "f.txt").write_text("changed\n")
+        _run_git(repo, "add", "f.txt")
+        bin_dir = tmp_path / "bin-blocking-diff"
+        _make_blocking_diff_git(bin_dir)
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        result = _staged_diff_hash(repo, "", env=env, timeout=30)
         assert result.returncode == 1
         assert result.stdout == ""

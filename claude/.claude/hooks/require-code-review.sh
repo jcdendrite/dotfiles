@@ -114,7 +114,7 @@ GATE_DIFF_BASE_STATUS=$?
 # collapsing to sha256(""), so a marker from one base's empty-diff case
 # can't validate a different base.
 if [ -z "$GATE_DIFF_BASE" ]; then
-  EMPTY_DIFF_CHECK=$(git -C "$REPO_ROOT" diff --cached 2>/dev/null)
+  EMPTY_DIFF_CHECK=$(_lib_capped git -C "$REPO_ROOT" diff --cached 2>/dev/null)
   if [ -z "$EMPTY_DIFF_CHECK" ]; then
     exit 0
   fi

@@ -25,6 +25,7 @@ from helpers import (
     extract_skill_command,
     multiedit_input,
     plan_review_marker_path,
+    push_conflicting_edit_to_origin,
     run_hook,
     run_hook_reason,
     run_skill_command,
@@ -2518,6 +2519,31 @@ def _make_git_rejecting_merge_base_flag(bin_dir):
     return shim
 
 
+def _make_blocking_merge_tree_git(bin_dir: Path) -> Path:
+    """For `merge-tree` specifically, writes a partial line to stdout then
+    blocks past the 5s cap; every other subcommand proxies to the real git.
+    Local copy of test_require_code_review.py's shim of the same name."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "merge-tree" ]; then\n'
+        '    printf "partialline"\n'
+        '    sleep 20\n'
+        '    exit 0\n'
+        '  fi\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _timeout_binary_present() -> bool:
+    return shutil.which("timeout") is not None or shutil.which("gtimeout") is not None
+
+
 class TestActivePlanFilesMergeAwareBase:
     """_lib_active_plan_files diffs against _lib_gate_diff_base's resolved
     base instead of the literal HEAD, so a plan file a trusted merge brought
@@ -2636,6 +2662,71 @@ class TestActivePlanFilesMergeAwareBase:
         )
         assert active.returncode == 0, active.stderr
         assert ".claude/plans/plan.md" in active.stdout.splitlines()
+
+    @pytest.mark.timing
+    @pytest.mark.skipif(
+        not _timeout_binary_present(), reason="no timeout/gtimeout on PATH to fire the cap"
+    )
+    def test_status_2_deny_message_names_undetermined_base(self, isolated_home, tmp_path):
+        """Mirrors test_require_code_review.py's
+        TestRequireCodeReviewMergeAwareBase::test_status_2_deny_message_names_undetermined_base
+        for require-plan-review.sh: status 2 never flips the allow/deny
+        decision -- it only changes what the deny message says. The
+        untracked plan file here already arms the gate unconditionally (see
+        _lib_active_plan_files' untracked-plans leg), so the ordinary
+        status-1 case (no merge/rebase/cherry-pick/revert in progress) and
+        the status-2 case (an in-progress merge whose base can't be
+        computed) must both deny -- the note is the only difference."""
+        no_merge_repo = tmp_path / "no-merge-repo"
+        no_merge_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=no_merge_repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=no_merge_repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=no_merge_repo, check=True)
+        (no_merge_repo / ".claude" / "plans").mkdir(parents=True)
+        (no_merge_repo / ".claude" / "plans" / "impl-plan.md").write_text(
+            "# Implementation plan\n\nStep 1...\n"
+        )
+        status_1_reason = run_hook_reason(
+            REQUIRE_PLAN_REVIEW_HOOK,
+            {**write_input(str(no_merge_repo / "src" / "foo.py")), "session_id": "session-status-1"},
+            cwd=no_merge_repo,
+        )
+        assert status_1_reason is not None, "untracked plan file with no marker must deny"
+        assert "novel-content base could not be computed" not in status_1_reason
+
+        bare, clone = bare_remote_with_default_branch(tmp_path)
+        (clone / "f").write_text("ours-edit\n")
+        subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+        subprocess.run(["git", "commit", "-qm", "ours edits f"], cwd=clone, check=True)
+        push_conflicting_edit_to_origin(tmp_path, bare, "f", "origin-edit\n")
+        subprocess.run(["git", "fetch", "-q", "origin"], cwd=clone, check=True)
+        result = subprocess.run(
+            ["git", "merge", "-q", "origin/main"], cwd=clone, capture_output=True, text=True
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert (clone / ".git" / "MERGE_HEAD").exists()
+        (clone / "f").write_text("resolved\n")
+        subprocess.run(["git", "add", "f"], cwd=clone, check=True)
+        (clone / ".claude" / "plans").mkdir(parents=True)
+        (clone / ".claude" / "plans" / "impl-plan.md").write_text(
+            "# Implementation plan\n\nStep 1...\n"
+        )
+
+        bin_dir = tmp_path / "bin-blocking-merge-tree"
+        _make_blocking_merge_tree_git(bin_dir)
+        extra_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "REAL_GIT": shutil.which("git"),
+        }
+        status_2_reason = run_hook_reason(
+            REQUIRE_PLAN_REVIEW_HOOK,
+            {**write_input(str(clone / "src" / "foo.py")), "session_id": "session-status-2"},
+            cwd=clone,
+            extra_env=extra_env,
+        )
+        assert status_2_reason is not None, "untracked plan file with no marker must deny"
+        assert "novel-content base could not be computed" in status_2_reason
+        assert "fell back to the full HEAD-relative plan-file diff" in status_2_reason
 
 
 def _plan_review_empty_base_marker_value(base: str) -> str:

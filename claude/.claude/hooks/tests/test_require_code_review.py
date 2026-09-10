@@ -1244,6 +1244,65 @@ class TestRequireCodeReviewMergeAwareBase:
         )
 
 
+def _make_blocking_diff_git(bin_dir: Path) -> Path:
+    """For `diff` specifically, writes a partial line to stdout then blocks
+    past the 5s cap; every other subcommand proxies to the real git. Local
+    copy of test_lib.py's shim of the same name."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "diff" ]; then\n'
+        '    printf "partialline"\n'
+        '    sleep 20\n'
+        '    exit 0\n'
+        '  fi\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+class TestRequireCodeReviewEmptyDiffCheckCapFaultInjection:
+    """require-code-review.sh's own EMPTY_DIFF_CHECK line (reached when
+    GATE_DIFF_BASE is empty, i.e. no merge/rebase/cherry-pick/revert is in
+    progress) wraps `git diff --cached` in _lib_capped, the third of three
+    capped-git-diff call sites guarding against the same hang risk. The
+    other two -- _lib_gate_diff_base's merge-tree call and
+    _lib_staged_diff_hash's diff call -- are covered at the function level
+    in test_lib.py; this class covers EMPTY_DIFF_CHECK at the full-hook
+    level."""
+
+    @pytest.mark.timing
+    @pytest.mark.skipif(
+        not _timeout_binary_present(), reason="no timeout/gtimeout on PATH to fire the cap"
+    )
+    def test_blocked_diff_denies_rather_than_allows_as_nothing_staged(
+        self, isolated_home, git_repo, tmp_path
+    ):
+        """A `git diff --cached` killed past the cap must not fall through
+        EMPTY_DIFF_CHECK's early exit as though nothing were staged --
+        git_repo has a real staged change, so allowing here would let an
+        unreviewed commit through."""
+        bin_dir = tmp_path / "bin-blocking-diff"
+        _make_blocking_diff_git(bin_dir)
+        extra_env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "REAL_GIT": shutil.which("git"),
+        }
+        assert (
+            run_hook(
+                CODE_REVIEW_HOOK,
+                bash_input("git commit -m foo", session_id=DEFAULT_TEST_SESSION_ID),
+                cwd=git_repo,
+                extra_env=extra_env,
+            )
+            == "deny"
+        )
+
+
 class TestRequireCodeReviewForgedAnchorEmptyBaseDiff:
     """Adversarial coverage for the empty-diff branch when GATE_DIFF_BASE is
     non-empty: a fabricated `commit-tree` commit and a hand-forged

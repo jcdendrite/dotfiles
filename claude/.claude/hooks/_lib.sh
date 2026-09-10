@@ -780,7 +780,7 @@ _lib_staged_diff_state() {
 #   revert       REVERT_HEAD exists
 # --absolute-git-dir (not --git-dir) resolves a linked worktree's own
 # per-worktree gitdir rather than the shared main one, which is where these
-# four markers actually live.
+# five markers actually live.
 #
 # Tri-state via exit status, the same 0/1/2 contract
 # _lib_command_invokes_git_subcmd already establishes in this file:
@@ -852,12 +852,6 @@ _lib_git_inprogress_state() {
 #     _lib_default_branch_or_guess) -- content already reviewed upstream.
 #   - HEAD -- content already committed in this repo, which required
 #     passing this same gate at its own commit time.
-# Both anchors are admitted despite neither being unforgeable: honestly
-# reaching either implies the content already passed review. Forging either
-# is no cheaper than building a commit with `commit-tree` and merging it in
-# cleanly -- a route that already reaches a commit with no gate seeing it at
-# all, forgery or not (full argument:
-# docs/design-decisions/merge-tree-base-recipe-for-gate-diff-base.md).
 # Reaching neither anchor falls back to the empty base, over-scoping rather
 # than smuggling content past the hash, for any of:
 #   - an unrelated cherry-pick source.
@@ -1721,8 +1715,14 @@ _lib_staged_length_gate() {
     return 0
   fi
 
-  local base
+  # base_status is intentionally not checked -- ${base:-HEAD} below already
+  # falls back to plain HEAD on status 1 or 2 alike, an over-strict rather
+  # than permissive failure direction. Captured for parity with this
+  # function's other _lib_gate_diff_base callers and for a future log line.
+  local base base_status
   base=$(_lib_gate_diff_base "$repo_root")
+  # shellcheck disable=SC2034 # base_status is captured for a future log line, not consumed today -- see the comment above.
+  base_status=$?
 
   local fail=0 messages="" f new old limit new_content old_content
   while IFS= read -r f; do
