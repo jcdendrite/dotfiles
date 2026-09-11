@@ -783,55 +783,17 @@ _lib_git_inprogress_state() {
 # Prints the tree-ish a commit-time gate should diff its staged content
 # against, in place of the index's implicit HEAD base -- so a gate that
 # hashes or scans `git diff --cached "$(_lib_gate_diff_base "$repo")"` sees
-# only content novel to the commit being made, even mid-merge.
-#
-# Outside an in-progress state (the overwhelming common case) this prints
-# nothing, and the call site issues plain `git diff --cached` with no base
-# argument. `git diff --cached HEAD` is deliberately not used as that "no
-# override" value: it fails on an unborn branch (no commits yet), where the
-# bare form succeeds.
-#
-# During a trusted in-progress state (see the anchor check below), this
-# computes the tree git's own automatic merge/rebase/cherry-pick/revert
-# machinery would have produced, via `git merge-tree --write-tree`. See
+# only content novel to the commit being made, even mid-merge. Outside an
+# in-progress state (the overwhelming common case) this prints nothing, and
+# the call site issues plain `git diff --cached` with no base argument.
+# During a trusted in-progress state, this computes the tree git's own
+# automatic merge/rebase/cherry-pick/revert machinery would have produced,
+# via `git merge-tree --write-tree`. See
 # docs/design-decisions/merge-tree-base-recipe-for-gate-diff-base.md for the
-# per-state command table and the anchor-admissibility argument this
-# function implements.
-#
-# Trust check, required before any of the above runs. Presence of
-# MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD/rebase-merge proves nothing by
-# itself: each is a plain gitdir file an ungated `git update-ref` or
-# `printf` can fabricate to point at arbitrary content. The state's own OID
-# (REBASE_HEAD/MERGE_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD's content,
-# unmodified) must therefore first reach one of two anchors via `git
-# merge-base --is-ancestor`:
-#   - the resolved default remote-tracking branch (origin/<default>, via
-#     _lib_default_branch_or_guess) -- content already reviewed upstream.
-#   - HEAD -- content already committed in this repo, which required
-#     passing this same gate at its own commit time.
-# Reaching neither anchor falls back to the empty base, over-scoping rather
-# than smuggling content past the hash, for any of:
-#   - an unrelated cherry-pick source.
-#   - a garbage or dangling OID.
-#   - an octopus MERGE_HEAD (multi-line, never a valid single revision).
-#   - a `--rebase-merges` replay of a merge commit, where REBASE_HEAD^ would
-#     silently resolve to the wrong parent.
-#
-# The trust-anchor check above is also the reason state_oid must be
-# shape-validated (a bare 40- or 64-hex-char string, git's two supported OID
-# lengths) before this function passes it as a positional argument to any
-# `git merge-base`/`merge-tree` invocation: state_oid comes from a plain
-# gitdir file, not from git itself, so nothing upstream of this function
-# guarantees it isn't attacker-controlled option-injection content (e.g. a
-# leading `--upload-pack=`) rather than a real OID.
-#
-# `merge-tree --write-tree`'s stdout is validated the same way regardless
-# of cause: take its first line (parameter expansion, matching
-# _lib_extract_git_subcmd's idiom, not a `head -1` fork) and require `git
-# rev-parse --verify --quiet "<line>^{tree}"` to succeed. A git older than
-# 2.38 rejecting `--write-tree` outright, or one accepting `--write-tree`
-# but rejecting `--merge-base=`, both fail this validation and fall back to
-# the empty base -- no version literal appears anywhere in this function.
+# per-state command table, the trust-anchor definitions and
+# admissibility argument, the fallback-case enumeration, and the
+# OID-shape and merge-tree-output validation this function applies before
+# trusting either.
 #
 # Tri-state via exit status, same contract as _lib_git_inprogress_state:
 #   - exit 0, stdout = a tree OID: an in-progress state was detected, its
@@ -841,26 +803,9 @@ _lib_git_inprogress_state() {
 #     for. This is the correct answer, not a degraded one.
 #   - exit 2, stdout empty: undetermined -- a capped git call inside
 #     detection or tree computation timed out, was killed, or its binary
-#     was missing (distinguished from an ordinary git failure by exit codes
-#     124/125/126/127/137, `timeout(1)`'s own documented set for "the
-#     wrapped command did not run to completion normally", as opposed to
-#     git's own exit codes for an ordinary negative answer).
-# "exit 2 => empty stdout" is load-bearing: every caller consumes stdout
-# unconditionally regardless of exit status, so a partial or candidate OID
-# escaping on a kill path would otherwise be consumed as a real base and
-# would narrow an authorization hash on nobody's authority. No caller
-# changes its allow/deny decision on status 2 alone -- it denies (or
-# allows, per its own existing fail posture) on the same empty-base
-# over-gating it already applies to status 1, and may additionally name the
-# undetermined base in its own deny message.
-#
-# The trust-anchor check (`git merge-base --is-ancestor`) is exempt from
-# the above status-2 distinction: any non-zero exit from it -- including
-# one driven by the same cap -- is treated identically as "not trusted",
-# per `git merge-base --is-ancestor`'s own documented contract (0 ancestor,
-# non-zero otherwise, including an unresolvable OID). Collapsing that
-# call's failure modes is safe because its only effect either way is the
-# conservative empty-base fallback that status 1 already produces.
+#     was missing. Every caller consumes stdout unconditionally regardless
+#     of exit status, so this must stay empty on status 2; see the
+#     design-decision doc for the full load-bearing safety argument.
 _lib_gate_diff_base() {
   [ "$#" -eq 1 ] || return 2
   local repo_root="$1"
@@ -914,6 +859,9 @@ _lib_gate_diff_base() {
       tree_out=$(_lib_capped git -C "$repo_root" merge-tree --write-tree "--merge-base=${state_oid}" HEAD "${state_oid}^" 2>/dev/null)
       tree_status=$?
       ;;
+    # Unreachable: the earlier case in this function already validates
+    # $state against these same four values with its own `*) return 2`.
+    *) return 2 ;;
   esac
   case "$tree_status" in
     124 | 125 | 126 | 127 | 137) return 2 ;;

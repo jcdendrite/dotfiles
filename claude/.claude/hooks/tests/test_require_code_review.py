@@ -819,10 +819,10 @@ def _build_disjoint_files_clean_merge(tmp_path: Path) -> Path:
     clone and origin each add a different file, so the auto-merged result
     has an empty base-relative diff even though the plain HEAD-relative diff
     is non-empty (it includes origin's own new file). This is the
-    disqualified fixture shape for M-1 (two disjoint files, not one file
-    touched by both sides) -- valid only for exercising the empty-diff
-    branch itself, not the merge-tree-vs-path-intersection primitive
-    choice."""
+    disqualified fixture shape for the primitive-choice case: merge-tree
+    vs. path-intersection (two disjoint files, not one file touched by
+    both sides) -- valid only for exercising the empty-diff branch
+    itself."""
     bare, clone = bare_remote_with_default_branch(tmp_path)
     (clone / "own.txt").write_text("own\n")
     subprocess.run(["git", "add", "own.txt"], cwd=clone, check=True)
@@ -1057,7 +1057,7 @@ class TestRequireCodeReviewMergeAwareBase:
     def test_single_file_non_overlapping_hunks_auto_merge_contributes_nothing(
         self, isolated_home, tmp_path
     ):
-        """The primitive-choice case (M-1): one file touched by both sides in
+        """The primitive-choice case: one file touched by both sides in
         non-overlapping hunks, auto-merging cleanly with no conflict. The
         fixture must be a single shared file -- two files each touched by one
         side (the case above) would pass under a path-intersection heuristic

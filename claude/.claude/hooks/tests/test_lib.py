@@ -5499,6 +5499,56 @@ def _make_blocking_merge_tree_git(bin_dir: Path) -> Path:
     return shim
 
 
+def _make_blocking_absolute_git_dir_git(bin_dir: Path) -> Path:
+    """Shim at bin_dir/git: for `rev-parse --absolute-git-dir` specifically,
+    writes a partial line to stdout then blocks past the 5s cap; every other
+    subcommand proxies to the real git. Same shape as
+    _make_blocking_merge_tree_git above, targeting _lib_gate_diff_base's
+    initial `git rev-parse --absolute-git-dir` call instead of its
+    merge-tree call."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$arg" = "--absolute-git-dir" ]; then\n'
+        '    printf "partialline"\n'
+        '    sleep 20\n'
+        '    exit 0\n'
+        '  fi\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def _make_blocking_tree_verify_git(bin_dir: Path) -> Path:
+    """Shim at bin_dir/git: for a `<tree-oid>^{tree}` revision argument
+    specifically, writes a partial line to stdout then blocks past the 5s
+    cap; every other subcommand proxies to the real git. Same shape as
+    _make_blocking_merge_tree_git above, targeting _lib_gate_diff_base's
+    final `git rev-parse --verify --quiet "${tree_oid}^{tree}"` validation
+    call instead of its merge-tree call."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "git"
+    shim.write_text(
+        '#!/bin/bash\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        '    *"^{tree}")\n'
+        '      printf "partialline"\n'
+        '      sleep 20\n'
+        '      exit 0\n'
+        '      ;;\n'
+        '  esac\n'
+        'done\n'
+        'exec "$REAL_GIT" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
 def _make_blocking_diff_git(bin_dir: Path) -> Path:
     """Shim at bin_dir/git: for `diff` specifically, writes a partial line to
     stdout then blocks past the 5s cap; every other subcommand proxies to the
@@ -5609,6 +5659,48 @@ class TestGateDiffBaseCapFaultInjection:
         build_conflicted_revert(repo)
         bin_dir = tmp_path / "bin-blocking-merge-tree"
         _make_blocking_merge_tree_git(bin_dir)
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        result = _gate_diff_base(repo, env=env, timeout=30)
+        assert result.returncode == 2
+        assert result.stdout == ""
+
+    @pytest.mark.timing
+    @pytest.mark.skipif(
+        not _timeout_binary_present(), reason="no timeout/gtimeout on PATH to fire the cap"
+    )
+    def test_blocking_absolute_git_dir_returns_undetermined_with_empty_stdout(
+        self, tmp_path: Path
+    ) -> None:
+        """Same safety property as the merge-tree case above, for
+        _lib_gate_diff_base's initial `git rev-parse --absolute-git-dir`
+        call -- its own independent `|| return 2` must not let a partial
+        gitdir escape onto stdout either."""
+        repo = tmp_path / "repo"
+        _init_repo_on_branch(repo, "main")
+        bin_dir = tmp_path / "bin-blocking-absolute-git-dir"
+        _make_blocking_absolute_git_dir_git(bin_dir)
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        result = _gate_diff_base(repo, env=env, timeout=30)
+        assert result.returncode == 2
+        assert result.stdout == ""
+
+    @pytest.mark.timing
+    @pytest.mark.skipif(
+        not _timeout_binary_present(), reason="no timeout/gtimeout on PATH to fire the cap"
+    )
+    def test_blocking_tree_verify_returns_undetermined_with_empty_stdout(
+        self, tmp_path: Path
+    ) -> None:
+        """Same safety property as the merge-tree case above, for
+        _lib_gate_diff_base's final `git rev-parse --verify --quiet
+        "${tree_oid}^{tree}"` validation call -- its own independent
+        exit-code-match block must not let the unvalidated tree_oid escape
+        onto stdout either."""
+        repo = tmp_path / "repo"
+        _init_repo_on_branch(repo, "main")
+        build_conflicted_revert(repo)
+        bin_dir = tmp_path / "bin-blocking-tree-verify"
+        _make_blocking_tree_verify_git(bin_dir)
         env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
         result = _gate_diff_base(repo, env=env, timeout=30)
         assert result.returncode == 2

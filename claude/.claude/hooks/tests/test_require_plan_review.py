@@ -2596,10 +2596,16 @@ class TestActivePlanFilesMergeAwareBase:
         assert ".claude/plans/shared-plan.md" in active_files
         assert ".claude/plans/upstream-only-plan.md" not in active_files
 
-    def test_fallback_write_tree_rejected_behaves_like_today(self, tmp_path):
+    def test_fallback_write_tree_rejected_behaves_like_today(self, plan_review_home, tmp_path):
         """`--write-tree` outright rejection (git < 2.38) must fall back to
         diffing against literal HEAD -- exactly today's plain recipe --
-        rather than hanging or misreporting the active set."""
+        rather than hanging or misreporting the active set. Routed through
+        the real hook (not a direct _lib_active_plan_files call) so a wiring
+        bug in require-plan-review.sh's own threading of
+        _lib_gate_diff_base's resolved base into _lib_active_plan_hash would
+        actually be caught -- matching
+        test_require_code_review.py::TestRequireCodeReviewMergeAwareBase::test_fallback_write_tree_rejected_behaves_like_today's
+        precedent."""
         bare, clone = bare_remote_with_default_branch(tmp_path)
         plans_dir = clone / ".claude" / "plans"
         plans_dir.mkdir(parents=True)
@@ -2632,21 +2638,30 @@ class TestActivePlanFilesMergeAwareBase:
         (plans_dir / "shared-plan.md").write_text("# shared plan\n\nresolved\n")
         subprocess.run(["git", "add", ".claude/plans/shared-plan.md"], cwd=clone, check=True)
 
+        sid = "test-fallback-write-tree"
+        write_plan_review_marker(plan_review_home, clone, sid, base="")
         bin_dir = tmp_path / "bin-fallback-write-tree"
         _make_git_rejecting_write_tree(bin_dir)
-        active = _active_plan_files(
-            clone, env_overrides={"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        extra_env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        assert (
+            run_hook(
+                REQUIRE_PLAN_REVIEW_HOOK,
+                {**write_input(str(clone / "src" / "unrelated.py")), "session_id": sid},
+                cwd=clone,
+                extra_env=extra_env,
+            )
+            == "allow"
         )
-        assert active.returncode == 0, active.stderr
-        assert ".claude/plans/shared-plan.md" in active.stdout.splitlines()
 
-    def test_fallback_merge_base_flag_rejected_behaves_like_today(self, tmp_path):
+    def test_fallback_merge_base_flag_rejected_behaves_like_today(self, plan_review_home, tmp_path):
         """The `--merge-base=` rejection band (git 2.38-2.39) only affects
         the three states whose merge-tree call passes that flag -- rebase,
         cherry-pick, revert, not merge -- so this needs its own fixture: a
         conflicted revert of a plan file, trusted via the HEAD anchor by
         construction, must still report the plan as active when the flag is
-        rejected and _lib_gate_diff_base falls back to a plain HEAD diff."""
+        rejected and _lib_gate_diff_base falls back to a plain HEAD diff.
+        Routed through the real hook for the same wiring-coverage reason as
+        the write-tree fallback test above."""
         repo = tmp_path / "repo"
         repo.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -2655,13 +2670,20 @@ class TestActivePlanFilesMergeAwareBase:
         (repo / ".claude" / "plans").mkdir(parents=True)
         build_conflicted_revert(repo, file_name=".claude/plans/plan.md")
 
+        sid = "test-fallback-merge-base"
+        write_plan_review_marker(plan_review_home, repo, sid, base="")
         bin_dir = tmp_path / "bin-fallback-merge-base"
         _make_git_rejecting_merge_base_flag(bin_dir)
-        active = _active_plan_files(
-            repo, env_overrides={"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        extra_env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_GIT": shutil.which("git")}
+        assert (
+            run_hook(
+                REQUIRE_PLAN_REVIEW_HOOK,
+                {**write_input(str(repo / "src" / "unrelated.py")), "session_id": sid},
+                cwd=repo,
+                extra_env=extra_env,
+            )
+            == "allow"
         )
-        assert active.returncode == 0, active.stderr
-        assert ".claude/plans/plan.md" in active.stdout.splitlines()
 
     @pytest.mark.timing
     @pytest.mark.skipif(

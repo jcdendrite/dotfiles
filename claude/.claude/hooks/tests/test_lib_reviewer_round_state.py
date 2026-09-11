@@ -519,7 +519,7 @@ class TestLibReviewerRoundStateValueMergeAwareBase:
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "REAL_GIT": shutil.which("git"),
         }
-        result = _state_value(repo, env_overrides=extra_env)
+        result = _state_value(repo, extra_env=extra_env)
         assert result.returncode == 0, result.stderr
         head_sha, diff_hash = result.stdout.split(" ", 1)
         expected_head_sha = subprocess.run(
@@ -548,7 +548,7 @@ class TestLibReviewerRoundStateValueMergeAwareBase:
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "REAL_GIT": shutil.which("git"),
         }
-        result = _state_value(repo, env_overrides=extra_env)
+        result = _state_value(repo, extra_env=extra_env)
         assert result.returncode == 0, result.stderr
         head_sha, diff_hash = result.stdout.split(" ", 1)
         expected_head_sha = subprocess.run(
