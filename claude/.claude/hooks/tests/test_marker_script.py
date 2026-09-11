@@ -672,11 +672,11 @@ class TestMarkerScriptEmptyStagedGuard:
         self, isolated_home, git_repo
     ):
         """Guard must NOT fire when staged is empty AND there are no unstaged
-        changes — the review-of-nothing escape hatch must stay open. But a
-        genuinely clean tree is exactly _lib_staged_diff_state's "empty"
-        outcome, so the write arm must exit 0 without writing a marker,
-        not silently record sha256sum's fixed-width empty-input digest as
-        though it hashed something."""
+        changes — the review-of-nothing escape hatch must stay open. A
+        genuinely clean tree makes `git diff --cached` produce zero bytes.
+        The write arm must still exit 0 without writing a marker. It must
+        not record sha256("")'s fixed-width digest as though it hashed real
+        content."""
         _seed_session(isolated_home, self.SID)
         # Unstage then discard the fixture's change so both index and working
         # tree are clean. Order matters: reset the index first (HEAD → index),
@@ -940,14 +940,14 @@ class TestHashStagedDiff:
 
     def test_git_external_diff_noop_misclassifies_staged_content_as_empty_rc(self, tmp_path) -> None:
         """A GIT_EXTERNAL_DIFF tool that exits 0 without writing to stdout
-        would make `git diff --cached` (no `--quiet`) itself hash empty
-        bytes for a genuinely staged change -- unlike _lib_staged_diff_state's
-        `--quiet` probe (never invokes an external-diff driver at all),
-        _hash_staged_diff's own hashed call is exactly the one that
-        GIT_EXTERNAL_DIFF can affect. A real external-diff helper always
-        writes its own diff text to stdout precisely so tools that hash or
-        display it see real content; this asserts against a deliberately
-        broken no-op helper, not a realistic one."""
+        makes `git diff --cached` (no `--quiet`) itself hash empty bytes for
+        a genuinely staged change. `git diff --cached --quiet` never invokes
+        an external-diff driver at all, so `_hash_staged_diff`'s own hashed
+        call is exactly the one that GIT_EXTERNAL_DIFF can affect. A real
+        external-diff helper always writes its own diff text to stdout,
+        precisely so tools that hash or display it see real content. This
+        test asserts against a deliberately broken no-op helper, not a
+        realistic one."""
         repo = tmp_path / "external-diff-repo"
         self._init_repo(repo)
         (repo / "f.txt").write_text("first\nsecond\n")
