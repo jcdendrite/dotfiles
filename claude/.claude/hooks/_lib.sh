@@ -474,9 +474,8 @@ _lib_marker_value_present() {
 # The "modified vs HEAD" leg diffs against BASE (already resolved by the
 # caller, typically via _lib_gate_diff_base -- see that function's own
 # docstring) instead of the literal HEAD, so a plan file a trusted
-# in-progress state brought in untouched is excluded from the active set;
-# an empty BASE means no override, diffing against literal HEAD exactly as
-# before this substitution existed.
+# in-progress state brought in untouched is excluded from the active set.
+# An empty BASE diffs against literal HEAD.
 # :(glob) confines the `*` to one path segment, preserving the maxdepth-1
 # scope.
 # --others without --exclude-standard keeps gitignored plans in the set,
@@ -540,11 +539,11 @@ _lib_active_plan_files() {
 # Three-outcome contract -- exit status disambiguates stdout, because
 # "nothing to gate" and "could not compute" must never collapse onto the
 # same caller-visible signal:
-#   - exit 0, non-empty stdout: the active plan set's hash -- the ordinary
-#     content hash, or (when BASE is non-empty and no plan file differs from
-#     it) a value bound to BASE's own identity instead of collapsing to
-#     empty stdout, closing the same forged-base risk documented at
-#     _lib_gate_diff_base's docstring and _lib_code_review_marker_value above.
+#   - exit 0, non-empty stdout: the active plan set's hash. When BASE is
+#     non-empty and no plan file differs from it, this binds to BASE's own
+#     identity instead of empty stdout -- see _lib_gate_diff_base's docstring
+#     and _lib_code_review_marker_value above for why a forged base must not
+#     collapse to the same value.
 #   - exit 0, empty stdout: no plan is active AND no trusted in-progress
 #     state was detected (BASE empty) -- the gate is disarmed.
 #   - exit 1, stdout = the path of the plan file that could not be hashed
@@ -1558,24 +1557,22 @@ _lib_length_ratchet_exceeded() {
 # already establishes: CALLER MUST define `emit_deny` (as every gate hook
 # does, per that function's own contract comment) and `limit_for` (a
 # function mapping a repo-root-relative staged path to its line-count
-# limit) before calling this. Also relies on the caller having already
-# populated $COMMAND and $TOOL_NAME via _lib_parse_tool_input_or_deny, on
-# the caller having already exited for a non-Bash TOOL_NAME, and on the
-# caller having already confirmed this is a git-commit-shaped command
-# (_lib_command_invokes_git_subcmd "$COMMAND" commit, failing closed on an
-# undetermined match) before ever resolving REPO_ROOT or calling this --
-# the commit-shape check must run before any git subprocess spawns, so it
-# lives in the caller, ahead of REPO_ROOT resolution, not in here.
+# limit) before calling this.
+#
+# Also relies on the caller having already:
+# - populated $COMMAND and $TOOL_NAME via _lib_parse_tool_input_or_deny
+# - exited for a non-Bash TOOL_NAME
+# - confirmed this is a git-commit-shaped command (_lib_command_invokes_git_subcmd
+#   "$COMMAND" commit, failing closed on an undetermined match), before ever
+#   resolving REPO_ROOT or calling this
+#
+# The commit-shape check must run before any git subprocess spawns, so it lives in
+# the caller, ahead of REPO_ROOT resolution, not in here.
 #
 # OVER_LIMIT_MESSAGE now carries only the caller's own over-limit sentence:
 # the gate-identity prefix comes from _lib_emit_deny's DENY_GATE_LABEL, not
 # from this parameter, so the two fail-closed/internal-error denies below
 # emit their own body text without re-deriving a prefix from it.
-#
-# Checked fail-closed on the commit-match check, matching both callers'
-# documented fail-closed posture: an undetermined match (sed/tr missing,
-# killed, or erroring inside _lib_command_invokes_git_subcmd) denies rather
-# than silently skipping the length check.
 #
 # The git calls below are capped via _lib_capped. rev-parse, diff --cached,
 # and the ":$f" show call all degrade to allow (not just to not-hanging) on
@@ -1598,18 +1595,19 @@ _lib_length_ratchet_exceeded() {
 #
 # `old` (the previously committed version, for both the line-count and
 # byte-count checks) is measured against _lib_gate_diff_base's resolved
-# base, not the literal HEAD -- resolved once above the loop below, since a
-# per-file resolution inside it would spawn state detection and a full
-# merge-tree --write-tree once per staged file for a value identical on
+# base, not the literal HEAD, resolved once above the loop below rather than
+# per staged file -- a per-file resolution would spawn state detection and a
+# full merge-tree --write-tree once per staged file for a value identical on
 # every iteration. This is a delta comparison (new > limit && new > old),
-# not an absolute diff: mid-merge, the base substitution stops upstream's
-# own growth of a file from being charged to the merger, since `old` would
-# otherwise be the pre-merge feature tip. Mid-rebase, where the base stays
-# empty because REBASE_HEAD reaches neither anchor in the ordinary case,
-# `old` falls back to mid-rebase HEAD -- the new base plus already-replayed
-# commits -- which is already the correct pre-commit baseline for the
-# commit being replayed, so this consumer has no rebase-specific over-count
-# either way.
+# not an absolute diff:
+# - Mid-merge: the base substitution stops upstream's own growth of a file
+#   from being charged to the merger, since `old` would otherwise be the
+#   pre-merge feature tip.
+# - Mid-rebase: the base stays empty because REBASE_HEAD reaches neither
+#   anchor in the ordinary case, so `old` falls back to mid-rebase HEAD --
+#   the new base plus already-replayed commits -- which is already the
+#   correct pre-commit baseline for the commit being replayed.
+# This consumer has no rebase-specific over-count either way.
 _lib_staged_length_gate() {
   local repo_root="$1" pattern="$2" over_limit_message="$3" byte_limit="${4:-}"
 

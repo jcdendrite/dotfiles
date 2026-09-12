@@ -150,7 +150,10 @@ def git_timeout_shim(tmp_path):
     test_deny_pii_in_commits.py and test_require_ready_for_review.py.
 
     `match_condition` is a `[ ... ]`/`[[ ... ]]` test expression, e.g.
-    `[ "$1" = "diff" ]` or `[ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]`.
+    `[ "$1" = "diff" ]` or `[ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]`. A
+    `$N`-pinned predicate is coupled to the target call site's argv shape
+    (e.g. a `-C <dir>` prefix shifts every position) and must be re-audited
+    whenever that call site's argv shape changes.
 
     Skips when `git` is absent, or when neither `timeout(1)` nor
     `gtimeout(1)` is available (stock macOS ships neither without Homebrew

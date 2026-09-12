@@ -809,6 +809,9 @@ class TestCheckClaudeMdLength:
 
     # --- Newly-capped `git cat-file -s` calls (byte dimension of
     # _lib_staged_length_gate) ---
+    #
+    # These calls run as `git -C "$repo_root" cat-file -s <operand>`, so the
+    # predicate below matches the subcommand on $3, not $1.
 
     @pytest.mark.timing
     def test_byte_cap_cat_file_git_timeout_engages_cap(
@@ -825,7 +828,7 @@ class TestCheckClaudeMdLength:
         repo = make_repo_with_byte_file(tmp_path, CLAUDE_MD_PATH, BYTE_LIMIT - 100)
         (repo / CLAUDE_MD_PATH).write_text(make_bytes(BYTE_LIMIT + 1))
         subprocess.run(["git", "add", CLAUDE_MD_PATH], cwd=repo, check=True)
-        env = git_timeout_shim('[ "$1" = "cat-file" ]')
+        env = git_timeout_shim('[ "$3" = "cat-file" ]')
         with assert_cap_engaged():
             decision = run_hook(
                 CHECK_CLAUDE_MD_LENGTH_HOOK,

@@ -92,8 +92,7 @@ fi
 # resolution here would double the merge-tree cost per commit for the exact
 # same result. Empty BASE means no in-progress state was trusted (status 1)
 # or the base could not be computed (status 2); either way the empty-diff
-# check below issues plain `git diff --cached`, byte-identical to today's
-# command.
+# check below issues plain `git diff --cached`, with no base argument.
 GATE_DIFF_BASE=$(_lib_gate_diff_base "$REPO_ROOT")
 GATE_DIFF_BASE_STATUS=$?
 
@@ -101,8 +100,8 @@ GATE_DIFF_BASE_STATUS=$?
 # substitute a base for: this commit authors nothing at all --
 # amend-message-only, --allow-empty, or nothing staged. Unaffected by the
 # base substitution below -- there is no trusted-but-forgeable anchor in
-# play here, so this stays a plain, unconditional early exit, byte-identical
-# to the pre-substitution recipe.
+# play here, so this stays a plain, unconditional early exit with no base
+# argument.
 # deny-invisible-commit-content.sh is what makes an empty diff here mean this
 # commit authors an empty commit, not that no commit will happen — do not
 # remove either half independently.

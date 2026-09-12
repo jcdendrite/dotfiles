@@ -593,6 +593,11 @@ class TestCheckSkillLength:
 
     # --- Newly-capped `git diff --cached --name-only` and `git rev-parse
     # --is-inside-work-tree` (_lib_staged_length_gate) ---
+    #
+    # Every git call in _lib_staged_length_gate runs as
+    # `git -C "$repo_root" <subcommand> <operand>`, so from the shim's
+    # perspective $1/$2 are always `-C`/the repo path; predicates below
+    # match the subcommand and operand on $3/$4, not $1/$2.
 
     @pytest.mark.timing
     def test_staged_diff_git_timeout_engages_cap(
@@ -604,10 +609,7 @@ class TestCheckSkillLength:
         pre-existing _lib_capped wrap. A capped, empty file list means no
         staged SKILL.md is scanned, so the gate degrades to allow rather
         than hanging — same degrade-not-hang shape the header comment
-        documents for a machine lacking timeout(1)/gtimeout(1) entirely.
-        Matches on $3, not $1: _lib_staged_length_gate now threads REPO_ROOT
-        through `git -C "$repo_root" diff ...`, so $1/$2 are `-C`/the repo
-        path on every call in this function."""
+        documents for a machine lacking timeout(1)/gtimeout(1) entirely."""
         (skill_repo / SKILL_PATH).write_text(make_skill_content(201))
         subprocess.run(["git", "add", SKILL_PATH], cwd=skill_repo, check=True)
         env = git_timeout_shim('[ "$3" = "diff" ]')
@@ -632,13 +634,13 @@ class TestCheckSkillLength:
         hanging — same degrade-not-hang shape. One instance here suffices
         for both check-skill-length.sh and check-claude-md-length.sh: the
         capped call is caller-invariant, running identically for both hooks
-        before either caller's own logic. Matches on $3, not $1: same
-        -C/repo-path shift as the `diff` test above -- this call also runs
-        before _lib_gate_diff_base's own rev-parse call, so matching the
-        first rev-parse invocation here still hits the intended call."""
+        before either caller's own logic. The predicate matches on both
+        subcommand and operand so it targets only this call, not the
+        earlier, uncapped `rev-parse --show-toplevel` REPO_ROOT-resolution
+        call each hook makes before _lib_staged_length_gate runs."""
         (skill_repo / SKILL_PATH).write_text(make_skill_content(201))
         subprocess.run(["git", "add", SKILL_PATH], cwd=skill_repo, check=True)
-        env = git_timeout_shim('[ "$3" = "rev-parse" ]')
+        env = git_timeout_shim('[ "$3" = "rev-parse" ] && [ "$4" = "--is-inside-work-tree" ]')
         with assert_cap_engaged():
             decision = run_hook(
                 CHECK_SKILL_LENGTH_HOOK,
@@ -649,6 +651,9 @@ class TestCheckSkillLength:
         assert decision == "allow"
 
     # --- Newly-tested `git show` calls (_lib_staged_length_gate) ---
+    #
+    # These calls run as `git -C "$repo_root" show <operand>`, so predicates
+    # below match the subcommand and operand on $3/$4, not $1/$2.
 
     @pytest.mark.timing
     def test_new_content_show_git_timeout_engages_cap(
@@ -661,7 +666,7 @@ class TestCheckSkillLength:
         over the limit regardless of old, so the gate degrades to allow."""
         (skill_repo / SKILL_PATH).write_text(make_skill_content(201))
         subprocess.run(["git", "add", SKILL_PATH], cwd=skill_repo, check=True)
-        env = git_timeout_shim(f'[ "$1" = "show" ] && [ "$2" = ":{SKILL_PATH}" ]')
+        env = git_timeout_shim(f'[ "$3" = "show" ] && [ "$4" = ":{SKILL_PATH}" ]')
         with assert_cap_engaged():
             decision = run_hook(
                 CHECK_SKILL_LENGTH_HOOK,
@@ -686,7 +691,7 @@ class TestCheckSkillLength:
         is not an instance of the HEAD-timeout false-deny defect."""
         (skill_repo / SKILL_PATH).write_text(make_skill_content(201))
         subprocess.run(["git", "add", SKILL_PATH], cwd=skill_repo, check=True)
-        env = git_timeout_shim(f'[ "$1" = "show" ] && [ "$2" = "HEAD:{SKILL_PATH}" ]')
+        env = git_timeout_shim(f'[ "$3" = "show" ] && [ "$4" = "HEAD:{SKILL_PATH}" ]')
         with assert_cap_engaged():
             decision = run_hook(
                 CHECK_SKILL_LENGTH_HOOK,
@@ -717,7 +722,7 @@ class TestCheckSkillLength:
         repo = make_repo_with_skill(tmp_path, 300)
         (repo / SKILL_PATH).write_text(make_skill_content(250))
         subprocess.run(["git", "add", SKILL_PATH], cwd=repo, check=True)
-        env = git_timeout_shim(f'[ "$1" = "show" ] && [ "$2" = "HEAD:{SKILL_PATH}" ]')
+        env = git_timeout_shim(f'[ "$3" = "show" ] && [ "$4" = "HEAD:{SKILL_PATH}" ]')
         with assert_cap_engaged():
             reason = run_hook_reason(
                 CHECK_SKILL_LENGTH_HOOK,
